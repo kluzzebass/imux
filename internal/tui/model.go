@@ -231,7 +231,7 @@ func newModel() *model {
 		dockCmd:   dock,
 		ids:       ids,
 		selected:  0,
-		events:    []string{"[o] (imux) merged log — dock below: ↑↓ select, 1–9 jump, s/t/k/z/v/y on the selected process."},
+		events:    []string{"[o] (imux) merged log — dock: ↑↓ 1–9 select · Enter inspector · s/t/k/z/v/y lifecycle."},
 	}
 }
 
@@ -418,6 +418,18 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else if m.overlay != overlayNone {
 				m.overlay = overlayNone
 			}
+		case "enter":
+			if m.overlay == overlayHelp {
+				break
+			}
+			if m.overlay == overlayInspector {
+				m.overlay = overlayNone
+				break
+			}
+			if m.currentID() != "" {
+				m.overlay = overlayInspector
+				m.refreshInspector()
+			}
 		case "i":
 			if m.overlay == overlayHelp {
 				break
@@ -538,7 +550,7 @@ func (m *model) renderFooter() string {
 			s = "Esc or ? returns"
 		}
 	case overlayInspector:
-		s = "Esc closes · r refresh"
+		s = "Esc or Enter closes · r refresh"
 	default:
 		s = "? help · q quit"
 	}
@@ -647,7 +659,7 @@ func (m *model) renderModal() string {
 			"  1-9           jump to process slot (first nine)",
 			"  s t k z v y   start / stop / kill / pause / continue / restart",
 			"  , or .        previous / next process (same as arrows)",
-			"  i             inspector overlay (r refreshes)",
+			"  Enter or i    inspector (Esc or Enter closes, r refreshes)",
 			"  ? Esc         help · close overlay",
 			"  q Ctrl+c      quit (stops running demos)",
 			"",
@@ -655,7 +667,7 @@ func (m *model) renderModal() string {
 		}
 	case overlayInspector:
 		title = "Inspector"
-		bodyLines = append(append([]string(nil), m.inspectLines...), "", "Esc closes · r refresh · ? help")
+		bodyLines = append(append([]string(nil), m.inspectLines...), "", "Esc or Enter closes · r refresh · ? help")
 	default:
 		title = ""
 	}
