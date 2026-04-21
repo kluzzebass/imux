@@ -56,11 +56,8 @@ close-checklist:
   @echo "1) Ensure issue status is in_review"
   @echo "2) Ask user to test"
   @echo "3) Ask user for explicit close approval"
-  @echo "4) Run: dcat close <issueId>"
-  @echo "5) Immediately commit all issue work on issue branch (including .dogcats/issues.jsonl)"
-  @echo "6) Merge issue branch into main"
-  @echo "7) Push main to remote"
-  @echo "8) Verify: dcat show <issueId> is closed; git status clean/on expected branch"
+  @echo "4) Run: just close-issue <issueId> \"<reason>\" \"<commit-message>\" yes"
+  @echo "5) Verify: dcat show <issueId> is closed; git status clean/on expected branch"
   @echo
   @echo "Non-negotiable:"
   @echo "- Do not skip or reorder steps"
@@ -69,9 +66,9 @@ close-checklist:
 
 # Enforced close transaction helper (close + commit + merge + push)
 # Example:
-# just close-issue --issue imux-21um --reason "Done" --commit-message "Close imux-21um: architecture scaffold complete" --approved yes
-close-issue *args:
-  ./scripts/close-issue.sh {{args}}
+# just close-issue imux-21um "Done" "Close imux-21um: architecture scaffold complete" yes
+close-issue issue reason commit_message approved='yes':
+  ./scripts/close-issue.sh --issue "{{issue}}" --reason "{{reason}}" --commit-message "{{commit_message}}" --approved "{{approved}}"
 
 # Clean build/test artifacts
 clean:

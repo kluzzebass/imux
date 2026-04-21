@@ -33,7 +33,7 @@ Execute these steps in this exact order:
 1. Ensure issue status is `in_review`
 2. Ask user to test
 3. Ask user for explicit close approval ("can I close this issue?")
-4. Run `just close-issue --issue <issueId> --reason "<reason>" --commit-message "<message>" --approved yes` immediately after approval
+4. Run `just close-issue <issueId> "<reason>" "<commit-message>" yes` immediately after approval
 5. Do not run close steps manually if the helper exists
 6. Verify final state (`dcat show <issueId>` is `closed`, `git status` clean/on expected branch)
 
