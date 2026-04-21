@@ -249,16 +249,6 @@ func (m *model) currentName() string {
 	return m.processes[m.selected]
 }
 
-func (m *model) dockLineForSelected() string {
-	if m.selected >= 0 && m.selected < len(m.dockCmd) {
-		return m.dockCmd[m.selected]
-	}
-	if m.currentID() != "" {
-		return string(m.currentID())
-	}
-	return ""
-}
-
 func (m *model) appendLogLine(line string) {
 	m.events = append(m.events, line)
 	if len(m.events) > 500 {
@@ -551,15 +541,7 @@ func (m *model) renderFooter() string {
 	case overlayInspector:
 		s = fmt.Sprintf("Inspector — %s · r refresh · Esc closes · ? help.", proc)
 	default:
-		snippet := m.dockLineForSelected()
-		if snippet == "" {
-			snippet = m.currentName()
-		}
-		maxSnip := min(24, max(4, m.width/3))
-		s = fmt.Sprintf(
-			"%s — ↑↓ · 1-9 · s t k z v y · i ? · q",
-			truncate(snippet, maxSnip),
-		)
+		s = "↑↓ · 1-9 · s t k z v y · i ? · q"
 	}
 	return padRight(truncate(s, m.width), m.width)
 }
