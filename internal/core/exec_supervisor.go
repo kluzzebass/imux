@@ -117,6 +117,21 @@ func (s *ExecSupervisor) List(_ context.Context) ([]ProcessSpec, error) {
 	return out, nil
 }
 
+// CurrentPID returns the OS process id for id while the managed process is running
+// (including stop/kill in flight). If there is no live OS child, ok is false.
+func (s *ExecSupervisor) CurrentPID(id ProcessID) (pid int, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, exists := s.procs[id]
+	if !exists || p == nil {
+		return 0, false
+	}
+	if p.pid == 0 {
+		return 0, false
+	}
+	return p.pid, true
+}
+
 // Start launches the OS child for id.
 func (s *ExecSupervisor) Start(ctx context.Context, id ProcessID) error {
 	s.mu.Lock()

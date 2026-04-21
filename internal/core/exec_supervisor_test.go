@@ -144,3 +144,43 @@ func TestExecSupervisorMuxedOutputLines(t *testing.T) {
 		t.Fatalf("want stderr line containing err, got %#v", lines)
 	}
 }
+
+func TestExecSupervisorCurrentPIDWhileRunning(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("uses sleep")
+	}
+	bus := NewChanEventBus()
+	store := NewMapStateStore()
+	sup := NewExecSupervisor(bus, store)
+	ctx := context.Background()
+	id := ProcessID("p1")
+	if err := sup.Register(ctx, ProcessSpec{
+		ID:      id,
+		Name:    "sleepy",
+		Command: "sleep",
+		Args:    []string{"5"},
+		Restart: RestartConfig{Policy: RestartNever},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := sup.CurrentPID(id); ok {
+		t.Fatal("did not expect pid before start")
+	}
+	if err := sup.Start(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	var pid int
+	for time.Now().Before(deadline) {
+		if p, ok := sup.CurrentPID(id); ok && p > 0 {
+			pid = p
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if pid == 0 {
+		t.Fatal("expected non-zero pid while running")
+	}
+	_ = sup.Stop(ctx, id)
+}

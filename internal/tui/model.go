@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"imux/internal/core"
+	"imux/internal/inspect"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -38,6 +39,10 @@ type model struct {
 	bus    core.EventBus
 	sub    <-chan core.Event
 	events []string
+
+	inspectLines   []string
+	inspectCPU     *inspect.CPUSample
+	inspectFocusID core.ProcessID
 }
 
 type tickMsg time.Time
@@ -141,6 +146,42 @@ func (m *model) appendCtlErr(op string, err error) {
 	m.appendLogLine(fmt.Sprintf("[error] %s %s (%s): %v", op, m.currentName(), m.currentID(), err))
 }
 
+func (m *model) refreshInspector() {
+	id := m.currentID()
+	name := m.currentName()
+	stStr := "(unknown)"
+	if st, ok := m.store.Get(id); ok {
+		stStr = string(st)
+	}
+	header := []string{
+		fmt.Sprintf("Process: %s (%s)", name, id),
+		fmt.Sprintf("State: %s", stStr),
+		"",
+	}
+	if m.sup == nil {
+		m.inspectLines = append(header, "No supervisor.")
+		return
+	}
+	pid, live := m.sup.CurrentPID(id)
+	if m.inspectFocusID != id {
+		m.inspectCPU = nil
+		m.inspectFocusID = id
+	}
+	if !live {
+		m.inspectLines = append(header, "OS process not running (no pid).")
+		return
+	}
+	detail, next, notes := inspect.Build(pid, m.inspectCPU)
+	m.inspectCPU = next
+	m.inspectLines = append(header, detail...)
+	if len(notes) > 0 {
+		m.inspectLines = append(m.inspectLines, "")
+		for _, n := range notes {
+			m.inspectLines = append(m.inspectLines, "— "+n)
+		}
+	}
+}
+
 func (m *model) drainEvents() {
 	if m.sub == nil {
 		return
@@ -218,6 +259,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.tick++
 		m.drainEvents()
 		m.refreshProcs()
+		if m.overlay == overlayInspector && m.tick%3 == 0 {
+			m.refreshInspector()
+		}
 		return m, tickCmd()
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -259,6 +303,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.overlay = overlayNone
 			} else {
 				m.overlay = overlayInspector
+				m.refreshInspector()
+			}
+		case "r":
+			if m.overlay == overlayInspector {
+				m.refreshInspector()
 			}
 		case "up":
 			if m.overlay == overlayHelp {
@@ -379,7 +428,7 @@ func (m *model) renderFooter() string {
 	case overlayProcesses:
 		s = "Processes — j/k move, Enter closes. ? help."
 	case overlayInspector:
-		s = fmt.Sprintf("Inspector — %s · Esc closes · ? help.", proc)
+		s = fmt.Sprintf("Inspector — %s · r refresh · Esc closes · ? help.", proc)
 	default:
 		s = fmt.Sprintf(
 			"%s — s start t stop k kill z pause v continue y restart · p i ? · q quit",
@@ -456,6 +505,10 @@ func (m *model) renderModal() string {
 		maxW = min(72, m.width-4)
 		maxH = min(22, m.height-4)
 	}
+	if m.overlay == overlayInspector {
+		maxW = min(72, m.width-4)
+		maxH = min(22, m.height-4)
+	}
 	if maxW < 24 {
 		maxW = 24
 	}
@@ -485,7 +538,7 @@ func (m *model) renderModal() string {
 			"Keys:",
 			"  s t k z v y   start / stop / kill / pause / continue / restart",
 			"  , or .        previous / next process",
-			"  p i           process list · inspector",
+			"  p i           process list · inspector (r refreshes)",
 			"  ? Esc         help · close overlay",
 			"  q Ctrl+c      quit (stops running demos)",
 			"",
@@ -503,18 +556,7 @@ func (m *model) renderModal() string {
 		bodyLines = append(bodyLines, "", "Enter closes · ? help")
 	case overlayInspector:
 		title = "Inspector"
-		id := m.currentID()
-		st, ok := m.store.Get(id)
-		stStr := string(st)
-		if !ok {
-			stStr = "(unknown)"
-		}
-		bodyLines = []string{
-			fmt.Sprintf("Process: %s (%s)", m.currentName(), id),
-			fmt.Sprintf("State: %s", stStr),
-			"",
-			"Esc closes · ? help",
-		}
+		bodyLines = append(append([]string(nil), m.inspectLines...), "", "Esc closes · r refresh · ? help")
 	default:
 		title = ""
 	}
