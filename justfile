@@ -3,9 +3,11 @@ set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 _default:
   @just --list
 
-# Run the app (pass args: `just run -- --help`)
+# Run the app. Pass imux args directly: `just run tui`, `just run run --help`, etc.
+# Do not put `--` between `run` and the imux subcommand (`just run -- tui` passes a
+# literal `--` into imux and breaks Cobra subcommand parsing).
 run *args:
-  go run . {{args}}
+  @go run . {{args}}
 
 # Build local binary
 build:

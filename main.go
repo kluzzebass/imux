@@ -3,7 +3,7 @@ package main
 import (
 	"os"
 
-	"github.com/kluzzebass/imux/internal/cli"
+	"imux/internal/cli"
 )
 
 func main() {
