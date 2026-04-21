@@ -7,6 +7,9 @@ type Supervisor interface {
 	Register(context.Context, ProcessSpec) error
 	Start(context.Context, ProcessID) error
 	Stop(context.Context, ProcessID) error
+	Kill(context.Context, ProcessID) error
+	Pause(context.Context, ProcessID) error
+	Continue(context.Context, ProcessID) error
 	Restart(context.Context, ProcessID) error
 	List(context.Context) ([]ProcessSpec, error)
 }

@@ -12,6 +12,11 @@ const (
 	EventProcessStopping   EventType = "process_stopping"
 	EventProcessExited     EventType = "process_exited"
 	EventProcessFailed     EventType = "process_failed"
+	EventProcessPaused     EventType = "process_paused"
+	EventProcessResumed    EventType = "process_resumed"
+	// EventProcessError reports an operator-visible problem (illegal transition,
+	// unsupported platform operation, etc.) without implying a crashed child.
+	EventProcessError EventType = "process_error"
 )
 
 // Event is emitted by supervisor components and consumed by UI/logging sinks.

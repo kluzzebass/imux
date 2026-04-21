@@ -1,9 +1,17 @@
 package cli
 
 import (
+	"context"
 	"fmt"
+	"os"
+	"os/signal"
+	"runtime"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
+
+	"imux/internal/core"
 
 	"github.com/spf13/cobra"
 )
@@ -43,10 +51,152 @@ func NewRunCommand() *cobra.Command {
 }
 
 func runNonTUI(cmd *cobra.Command, opts RunOptions, commands []string) error {
-	_ = opts
-	_ = commands
-	_, err := fmt.Fprintln(cmd.OutOrStdout(), "imux run: non-TUI mode scaffold (execution engine pending)")
-	return err
+	_ = opts.TeePath // reserved for stream logging (imux-38oz)
+
+	names := opts.Names
+	if len(names) == 0 {
+		for i := range commands {
+			names = append(names, strconv.Itoa(i+1))
+		}
+	}
+	if len(names) != len(commands) {
+		return fmt.Errorf("%d names but %d commands", len(names), len(commands))
+	}
+
+	bus := core.NewChanEventBus()
+	store := core.NewMapStateStore()
+	sup := core.NewExecSupervisor(bus, store)
+	sup.SetStopGrace(opts.Grace)
+
+	errOut := cmd.ErrOrStderr()
+	sub := bus.Subscribe(512)
+	go func() {
+		for e := range sub {
+			if e.Type == core.EventProcessError {
+				_, _ = fmt.Fprintf(errOut, "imux error: %s [%s] %s\n", e.ProcessID, e.Type, e.Message)
+				continue
+			}
+			_, _ = fmt.Fprintf(errOut, "imux: [%s] %s %s\n", e.Type, e.ProcessID, e.Message)
+		}
+	}()
+
+	ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	shCmd, shArg := shellInvocation()
+	ids := make([]core.ProcessID, len(commands))
+	for i, c := range commands {
+		id := core.ProcessID(names[i])
+		ids[i] = id
+		args := []string{shArg, c}
+		if err := sup.Register(ctx, core.ProcessSpec{
+			ID:      id,
+			Name:    names[i],
+			Command: shCmd,
+			Args:    args,
+			Restart: core.RestartConfig{Policy: core.RestartNever},
+		}); err != nil {
+			return err
+		}
+		if err := sup.Start(ctx, id); err != nil {
+			return err
+		}
+	}
+
+	failFastCh := make(chan core.ProcessID, 1)
+	if !opts.NoFailFast {
+		go func() {
+			sub2 := bus.Subscribe(128)
+			for e := range sub2 {
+				if e.Type == core.EventProcessFailed {
+					select {
+					case failFastCh <- e.ProcessID:
+					default:
+					}
+				}
+			}
+		}()
+	}
+
+	waitAll := func() {
+		deadline := time.Now().Add(2 * time.Hour)
+		for time.Now().Before(deadline) {
+			allTerminal := true
+			snap := store.Snapshot()
+			for _, id := range ids {
+				st, ok := snap.Processes[id]
+				if !ok || (st != core.StateExited && st != core.StateFailed) {
+					allTerminal = false
+					break
+				}
+			}
+			if allTerminal {
+				return
+			}
+			time.Sleep(40 * time.Millisecond)
+		}
+	}
+
+	go func() {
+		<-ctx.Done()
+		for i := len(ids) - 1; i >= 0; i-- {
+			id := ids[i]
+			st, ok := store.Get(id)
+			if !ok {
+				continue
+			}
+			if st == core.StateRunning || st == core.StatePaused || st == core.StateStarting {
+				_ = sup.Stop(context.Background(), id)
+			}
+		}
+	}()
+
+	if opts.NoFailFast {
+		waitAll()
+	} else {
+		waitDone := make(chan struct{})
+		go func() {
+			waitAll()
+			close(waitDone)
+		}()
+		select {
+		case id := <-failFastCh:
+			_, _ = fmt.Fprintf(errOut, "imux: process %s failed; stopping others\n", id)
+			stop()
+			<-waitDone
+		case <-waitDone:
+		}
+	}
+
+	exitCode := 0
+	snap := store.Snapshot()
+	for _, id := range ids {
+		if st, ok := snap.Processes[id]; ok && st == core.StateFailed {
+			exitCode = 1
+		}
+	}
+	if exitCode != 0 {
+		stop()
+		for i := len(ids) - 1; i >= 0; i-- {
+			id := ids[i]
+			st, ok := store.Get(id)
+			if !ok {
+				continue
+			}
+			if st == core.StateRunning || st == core.StatePaused || st == core.StateStarting {
+				_ = sup.Stop(context.Background(), id)
+			}
+		}
+		os.Exit(exitCode)
+	}
+	return nil
+}
+
+func shellInvocation() (cmd string, arg string) {
+	if runtime.GOOS == "windows" {
+		return "cmd.exe", "/C"
+	}
+	return "sh", "-c"
 }
 
 func splitCSV(input string) []string {

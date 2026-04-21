@@ -7,6 +7,7 @@ const (
 	StatePending  ProcessState = "pending"
 	StateStarting ProcessState = "starting"
 	StateRunning  ProcessState = "running"
+	StatePaused   ProcessState = "paused"
 	StateStopping ProcessState = "stopping"
 	StateExited   ProcessState = "exited"
 	StateFailed   ProcessState = "failed"
@@ -37,16 +38,24 @@ func ApplyLifecycleEvent(current ProcessState, eventType EventType) (ProcessStat
 		if current == StateStarting {
 			return StateRunning, true
 		}
+	case EventProcessPaused:
+		if current == StateRunning {
+			return StatePaused, true
+		}
+	case EventProcessResumed:
+		if current == StatePaused {
+			return StateRunning, true
+		}
 	case EventProcessStopping:
-		if current == StateRunning || current == StateStarting {
+		if current == StateRunning || current == StateStarting || current == StatePaused {
 			return StateStopping, true
 		}
 	case EventProcessExited:
-		if current == StateStopping || current == StateRunning || current == StateStarting {
+		if current == StateStopping || current == StateRunning || current == StateStarting || current == StatePaused {
 			return StateExited, true
 		}
 	case EventProcessFailed:
-		if current == StateStarting || current == StateRunning || current == StateStopping {
+		if current == StateStarting || current == StateRunning || current == StateStopping || current == StatePaused {
 			return StateFailed, true
 		}
 	}

@@ -113,6 +113,27 @@ func TestApplyLifecycleEvent(t *testing.T) {
 			want:    StatePending,
 			ok:      false,
 		},
+		{
+			name:    "running to paused",
+			current: StateRunning,
+			event:   EventProcessPaused,
+			want:    StatePaused,
+			ok:      true,
+		},
+		{
+			name:    "paused to running",
+			current: StatePaused,
+			event:   EventProcessResumed,
+			want:    StateRunning,
+			ok:      true,
+		},
+		{
+			name:    "paused to stopping",
+			current: StatePaused,
+			event:   EventProcessStopping,
+			want:    StateStopping,
+			ok:      true,
+		},
 	}
 
 	for _, tc := range tests {

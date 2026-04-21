@@ -1,9 +1,14 @@
 package tui
 
 import (
+	"context"
 	"fmt"
+	"runtime"
+	"sort"
 	"strings"
 	"time"
+
+	"imux/internal/core"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -22,10 +27,17 @@ type model struct {
 	width        int
 	height       int
 	overlay      overlayKind
-	helpReturnTo overlayKind // where Esc/? goes after closing help (if not overlayNone)
+	helpReturnTo overlayKind
 	processes    []string
+	ids          []core.ProcessID
 	selected     int
-	tick         int // bumped on tea.Tick so the log view keeps refreshing
+	tick         int
+
+	sup    *core.ExecSupervisor
+	store  core.StateStore
+	bus    core.EventBus
+	sub    <-chan core.Event
+	events []string
 }
 
 type tickMsg time.Time
@@ -38,25 +50,162 @@ func tickCmd() tea.Cmd {
 	})
 }
 
-func newModel() model {
-	return model{
-		processes: []string{
-			"api",
-			"worker",
-			"scheduler",
-		},
-		selected: 0,
+func demoLongCommand() (cmd string, args []string) {
+	if runtime.GOOS == "windows" {
+		return "timeout", []string{"/t", "86400", "/nobreak"}
+	}
+	return "sleep", []string{"86400"}
+}
+
+func newModel() *model {
+	bus := core.NewChanEventBus()
+	store := core.NewMapStateStore()
+	sup := core.NewExecSupervisor(bus, store)
+	sup.SetStopGrace(10 * time.Second)
+	ctx := context.Background()
+
+	demos := []struct {
+		id, name string
+	}{
+		{"a", "demo-a"},
+		{"b", "demo-b"},
+		{"c", "demo-c"},
+	}
+	shCmd, shArg := "sh", "-c"
+	if runtime.GOOS == "windows" {
+		shCmd, shArg = "cmd.exe", "/C"
+	}
+	dc, da := demoLongCommand()
+	inner := fmt.Sprintf("%s %s", dc, strings.Join(da, " "))
+	if runtime.GOOS == "windows" {
+		inner = fmt.Sprintf("%s %s", dc, strings.Join(da, " "))
+	}
+
+	names := make([]string, 0, len(demos))
+	ids := make([]core.ProcessID, 0, len(demos))
+	for _, d := range demos {
+		id := core.ProcessID(d.id)
+		args := []string{shArg, inner}
+		if runtime.GOOS == "windows" {
+			args = []string{shArg, inner}
+		}
+		_ = sup.Register(ctx, core.ProcessSpec{
+			ID:      id,
+			Name:    d.name,
+			Command: shCmd,
+			Args:    args,
+			Restart: core.RestartConfig{Policy: core.RestartNever},
+		})
+		names = append(names, d.name)
+		ids = append(ids, id)
+	}
+
+	return &model{
+		sup:       sup,
+		store:     store,
+		bus:       bus,
+		sub:       bus.Subscribe(512),
+		processes: names,
+		ids:       ids,
+		selected:  0,
+		events:    []string{"[o] (imux) lifecycle log — start processes with s; errors appear here and on stderr from imux run."},
 	}
 }
 
-func (m model) Init() tea.Cmd {
+func (m *model) currentID() core.ProcessID {
+	if m.selected < 0 || m.selected >= len(m.ids) {
+		return ""
+	}
+	return m.ids[m.selected]
+}
+
+func (m *model) currentName() string {
+	if m.selected < 0 || m.selected >= len(m.processes) {
+		return ""
+	}
+	return m.processes[m.selected]
+}
+
+func (m *model) appendLogLine(line string) {
+	m.events = append(m.events, line)
+	if len(m.events) > 500 {
+		m.events = m.events[len(m.events)-500:]
+	}
+}
+
+func (m *model) appendCtlErr(op string, err error) {
+	if err == nil {
+		m.appendLogLine(fmt.Sprintf("[ok] %s %s (%s)", op, m.currentName(), m.currentID()))
+		return
+	}
+	m.appendLogLine(fmt.Sprintf("[error] %s %s (%s): %v", op, m.currentName(), m.currentID(), err))
+}
+
+func (m *model) drainEvents() {
+	if m.sub == nil {
+		return
+	}
+	for {
+		select {
+		case e := <-m.sub:
+			m.appendLogLine(fmt.Sprintf("[%s] %s %s", e.Type, e.ProcessID, e.Message))
+		default:
+			return
+		}
+	}
+}
+
+func (m *model) refreshProcs() {
+	if m.sup == nil {
+		return
+	}
+	specs, err := m.sup.List(context.Background())
+	if err != nil {
+		return
+	}
+	sort.Slice(specs, func(i, j int) bool { return specs[i].ID < specs[j].ID })
+	names := make([]string, len(specs))
+	ids := make([]core.ProcessID, len(specs))
+	for i, sp := range specs {
+		names[i] = sp.Name
+		ids[i] = sp.ID
+	}
+	m.processes = names
+	m.ids = ids
+	if m.selected >= len(m.ids) {
+		m.selected = len(m.ids) - 1
+	}
+	if m.selected < 0 {
+		m.selected = 0
+	}
+}
+
+func (m *model) shutdownProcs() {
+	if m.sup == nil {
+		return
+	}
+	ctx := context.Background()
+	for _, id := range m.ids {
+		st, ok := m.store.Get(id)
+		if !ok {
+			continue
+		}
+		if st == core.StateRunning || st == core.StatePaused || st == core.StateStarting {
+			_ = m.sup.Stop(ctx, id)
+		}
+	}
+}
+
+func (m *model) Init() tea.Cmd {
 	return tickCmd()
 }
 
-func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tickMsg:
 		m.tick++
+		m.drainEvents()
+		m.refreshProcs()
 		return m, tickCmd()
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -64,6 +213,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c", "q":
+			m.shutdownProcs()
 			return m, tea.Quit
 		case "?":
 			if m.overlay == overlayHelp {
@@ -98,19 +248,41 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				m.overlay = overlayInspector
 			}
-		case "up", "k":
+		case "up":
 			if m.overlay == overlayHelp {
 				break
 			}
 			if m.overlay == overlayProcesses && m.selected > 0 {
 				m.selected--
 			}
-		case "down", "j":
+		case "k":
+			if m.overlay == overlayHelp {
+				break
+			}
+			if m.overlay == overlayProcesses && m.selected > 0 {
+				m.selected--
+				break
+			}
+			if m.overlay == overlayNone && m.sup != nil {
+				ctx := context.Background()
+				if id := m.currentID(); id != "" {
+					m.appendCtlErr("kill", m.sup.Kill(ctx, id))
+				}
+			}
+		case "down":
 			if m.overlay == overlayHelp {
 				break
 			}
 			if m.overlay == overlayProcesses && m.selected < len(m.processes)-1 {
 				m.selected++
+			}
+		case "j":
+			if m.overlay == overlayHelp {
+				break
+			}
+			if m.overlay == overlayProcesses && m.selected < len(m.processes)-1 {
+				m.selected++
+				break
 			}
 		case "enter":
 			if m.overlay == overlayHelp {
@@ -133,13 +305,33 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.overlay == overlayNone && m.selected < len(m.processes)-1 {
 				m.selected++
 			}
+		default:
+			if m.overlay == overlayNone && m.sup != nil {
+				ctx := context.Background()
+				id := m.currentID()
+				if id == "" {
+					break
+				}
+				switch msg.String() {
+				case "s":
+					m.appendCtlErr("start", m.sup.Start(ctx, id))
+				case "t":
+					m.appendCtlErr("stop", m.sup.Stop(ctx, id))
+				case "z":
+					m.appendCtlErr("pause", m.sup.Pause(ctx, id))
+				case "v":
+					m.appendCtlErr("continue", m.sup.Continue(ctx, id))
+				case "y":
+					m.appendCtlErr("restart", m.sup.Restart(ctx, id))
+				}
+			}
 		}
 	}
 
 	return m, nil
 }
 
-func (m model) View() string {
+func (m *model) View() string {
 	if m.width < 40 || m.height < 8 {
 		return "Terminal too small for imux TUI (need at least 40x8). Press q to quit."
 	}
@@ -162,32 +354,30 @@ func (m model) View() string {
 	return lipgloss.JoinVertical(lipgloss.Left, body, footerStyled)
 }
 
-// renderFooter is one line of context-aware hints (truncated on narrow terminals).
-func (m model) renderFooter() string {
-	proc := m.processes[m.selected]
+func (m *model) renderFooter() string {
+	proc := m.currentName()
 	var s string
 	switch m.overlay {
 	case overlayHelp:
 		if m.helpReturnTo == overlayNone {
-			s = "Help — Esc or ? closes. While viewing output: , . switch process; p list; i inspector; q quit."
+			s = "Help — Esc or ? closes. s start · t stop · k kill · z pause · v continue · y restart · p list · i inspector · , . focus · q quit."
 		} else {
-			s = "Help — Esc or ? returns to the previous panel. Same keys apply when you go back."
+			s = "Help — Esc or ? returns to the previous panel."
 		}
 	case overlayProcesses:
-		s = "Processes — arrow keys or j/k to move, Enter picks, Esc closes. ? full help."
+		s = "Processes — j/k move, Enter closes. ? help."
 	case overlayInspector:
-		s = fmt.Sprintf("Inspector for %s — metadata is placeholder for now. Esc closes. ? full help.", proc)
+		s = fmt.Sprintf("Inspector — %s · Esc closes · ? help.", proc)
 	default:
 		s = fmt.Sprintf(
-			"Watching %s — , or . previous/next process; p processes; i inspector; ? help; q quit.",
+			"%s — s start t stop k kill z pause v continue y restart · p i ? · q quit",
 			proc,
 		)
 	}
 	return padRight(truncate(s, m.width), m.width)
 }
 
-func (m model) renderBody(bodyH int) string {
-	// Full-bleed log region (no border) — merged stdout/stderr placeholder until imux-38oz.
+func (m *model) renderBody(bodyH int) string {
 	w := m.width
 	if w < 1 {
 		w = 1
@@ -197,7 +387,7 @@ func (m model) renderBody(bodyH int) string {
 		h = 1
 	}
 
-	lines := m.placeholderStreamLines(h)
+	lines := m.composeLines(h)
 	for i := range lines {
 		lines[i] = padRight(truncate(lines[i], w), w)
 	}
@@ -205,17 +395,37 @@ func (m model) renderBody(bodyH int) string {
 	return strings.Join(lines, "\n")
 }
 
-func (m model) placeholderStreamLines(n int) []string {
-	proc := m.processes[m.selected]
+func (m *model) composeLines(n int) []string {
+	ev := m.events
+	if len(ev) >= n {
+		return append([]string(nil), ev[len(ev)-n:]...)
+	}
+	ph := m.placeholderStreamLines(n - len(ev))
+	out := append([]string(nil), ph...)
+	out = append(out, ev...)
+	for len(out) < n {
+		out = append(out, "")
+	}
+	if len(out) > n {
+		out = out[len(out)-n:]
+	}
+	return out
+}
+
+func (m *model) placeholderStreamLines(n int) []string {
+	proc := m.currentName()
+	if proc == "" {
+		proc = "(none)"
+	}
 	t := m.tick
 	out := make([]string, 0, n)
-	out = append(out, fmt.Sprintf("[o] (%s) stdout line — multiplexed stream placeholder (t=%d)", proc, t))
-	out = append(out, fmt.Sprintf("[e] (%s) stderr line — differentiated in imux-38oz (t=%d)", proc, t))
+	out = append(out, fmt.Sprintf("[o] (%s) stdout placeholder (t=%d)", proc, t))
+	out = append(out, fmt.Sprintf("[e] (%s) stderr placeholder (t=%d)", proc, t))
 	for i := 2; i < n; i++ {
 		if i%3 == 0 {
-			out = append(out, fmt.Sprintf("[o] (%s) line=%d tick=%d …", proc, i, t+i))
+			out = append(out, fmt.Sprintf("[o] (%s) line=%d …", proc, i))
 		} else {
-			out = append(out, fmt.Sprintf("[e] (%s) line=%d tick=%d …", proc, i, t+i))
+			out = append(out, fmt.Sprintf("[e] (%s) line=%d …", proc, i))
 		}
 	}
 	if len(out) > n {
@@ -227,7 +437,7 @@ func (m model) placeholderStreamLines(n int) []string {
 	return out
 }
 
-func (m model) renderModal() string {
+func (m *model) renderModal() string {
 	maxW := min(56, m.width-6)
 	maxH := min(16, m.height-6)
 	if m.overlay == overlayHelp {
@@ -242,7 +452,7 @@ func (m model) renderModal() string {
 	}
 
 	innerW := maxW - 2
-	innerLines := maxH - 2 // lines inside border (title + body rows)
+	innerLines := maxH - 2
 	if innerW < 4 {
 		innerW = 4
 	}
@@ -255,20 +465,19 @@ func (m model) renderModal() string {
 	switch m.overlay {
 	case overlayHelp:
 		title = "Help"
-		proc := m.processes[m.selected]
+		proc := m.currentName()
 		bodyLines = []string{
-			"One merged log view; focus picks which process labels the",
-			"stream (placeholder until live attach).",
+			"One merged log view; lifecycle lines come from the supervisor",
+			"event bus (errors are prefixed with [error]).",
 			"",
 			"Keys:",
-			"  , or .     previous / next process (main view)",
-			"  p          process list (pick focus)",
-			"  i          inspector for focused process",
-			"  ?          this help (again or Esc closes)",
-			"  Esc        close top overlay",
-			"  q Ctrl+c   quit",
+			"  s t k z v y   start / stop / kill / pause / continue / restart",
+			"  , or .        previous / next process",
+			"  p i           process list · inspector",
+			"  ? Esc         help · close overlay",
+			"  q Ctrl+c      quit (stops running demos)",
 			"",
-			fmt.Sprintf("Focus: %s", proc),
+			fmt.Sprintf("Focus: %s (%s)", proc, m.currentID()),
 		}
 	case overlayProcesses:
 		title = "Processes"
@@ -279,13 +488,18 @@ func (m model) renderModal() string {
 			}
 			bodyLines = append(bodyLines, prefix+name)
 		}
-		bodyLines = append(bodyLines, "", "Enter confirms focus · Esc closes · ? help")
+		bodyLines = append(bodyLines, "", "Enter closes · ? help")
 	case overlayInspector:
 		title = "Inspector"
-		proc := m.processes[m.selected]
+		id := m.currentID()
+		st, ok := m.store.Get(id)
+		stStr := string(st)
+		if !ok {
+			stStr = "(unknown)"
+		}
 		bodyLines = []string{
-			fmt.Sprintf("Process: %s", proc),
-			"Metadata / state placeholder (imux-1xp2).",
+			fmt.Sprintf("Process: %s (%s)", m.currentName(), id),
+			fmt.Sprintf("State: %s", stStr),
 			"",
 			"Esc closes · ? help",
 		}
@@ -293,7 +507,7 @@ func (m model) renderModal() string {
 		title = ""
 	}
 
-	bodyRows := innerLines - 1 // first inner row is title bar
+	bodyRows := innerLines - 1
 	if bodyRows < 1 {
 		bodyRows = 1
 	}
