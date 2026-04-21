@@ -51,8 +51,6 @@ func NewRunCommand() *cobra.Command {
 }
 
 func runNonTUI(cmd *cobra.Command, opts RunOptions, commands []string) error {
-	_ = opts.TeePath // reserved for stream logging (imux-38oz)
-
 	names := opts.Names
 	if len(names) == 0 {
 		for i := range commands {
@@ -68,15 +66,41 @@ func runNonTUI(cmd *cobra.Command, opts RunOptions, commands []string) error {
 	sup := core.NewExecSupervisor(bus, store)
 	sup.SetStopGrace(opts.Grace)
 
+	var teeOut *os.File
+	if opts.TeePath != "" {
+		f, err := os.OpenFile(opts.TeePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			return fmt.Errorf("tee %q: %w", opts.TeePath, err)
+		}
+		defer f.Close()
+		teeOut = f
+	}
+
 	errOut := cmd.ErrOrStderr()
-	sub := bus.Subscribe(512)
+	out := cmd.OutOrStdout()
+	sub := bus.Subscribe(4096)
 	go func() {
 		for e := range sub {
-			if e.Type == core.EventProcessError {
+			switch e.Type {
+			case core.EventProcessOutput:
+				tag := e.Stream
+				if tag == "" {
+					tag = "?"
+				}
+				who := string(e.ProcessID)
+				if e.ProcessName != "" {
+					who = e.ProcessName
+				}
+				line := fmt.Sprintf("[%s|%s] %s\n", tag, who, e.Message)
+				_, _ = fmt.Fprint(out, line)
+				if teeOut != nil {
+					_, _ = fmt.Fprint(teeOut, line)
+				}
+			case core.EventProcessError:
 				_, _ = fmt.Fprintf(errOut, "imux error: %s [%s] %s\n", e.ProcessID, e.Type, e.Message)
-				continue
+			default:
+				_, _ = fmt.Fprintf(errOut, "imux: [%s] %s %s\n", e.Type, e.ProcessID, e.Message)
 			}
-			_, _ = fmt.Fprintf(errOut, "imux: [%s] %s %s\n", e.Type, e.ProcessID, e.Message)
 		}
 	}()
 

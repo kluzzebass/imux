@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -78,5 +79,68 @@ func TestExecSupervisorPauseContinueUnix(t *testing.T) {
 	}
 	if err := sup.Stop(ctx, id); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestExecSupervisorMuxedOutputLines(t *testing.T) {
+	t.Parallel()
+	bus := NewChanEventBus()
+	sub := bus.Subscribe(256)
+	store := NewMapStateStore()
+	sup := NewExecSupervisor(bus, store)
+	ctx := context.Background()
+	id := ProcessID("p1")
+
+	shell, args := "sh", []string{"-c", "echo hello; echo err >&2"}
+	if runtime.GOOS == "windows" {
+		shell, args = "cmd.exe", []string{"/C", "echo hello & echo err 1>&2"}
+	}
+
+	if err := sup.Register(ctx, ProcessSpec{
+		ID:      id,
+		Name:    "mux",
+		Command: shell,
+		Args:    args,
+		Restart: RestartConfig{Policy: RestartNever},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sup.Start(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+
+	type line struct {
+		stream, msg string
+	}
+	var lines []line
+	deadline := time.After(5 * time.Second)
+	exited := false
+	for !exited {
+		select {
+		case e := <-sub:
+			switch e.Type {
+			case EventProcessOutput:
+				lines = append(lines, line{e.Stream, e.Message})
+			case EventProcessExited:
+				exited = true
+			}
+		case <-deadline:
+			t.Fatalf("timeout; got %#v", lines)
+		}
+	}
+
+	has := func(stream, needle string) bool {
+		for _, l := range lines {
+			if l.stream == stream && strings.Contains(l.msg, needle) {
+				return true
+			}
+		}
+		return false
+	}
+	if !has("o", "hello") {
+		t.Fatalf("want stdout line containing hello, got %#v", lines)
+	}
+	if !has("e", "err") {
+		t.Fatalf("want stderr line containing err, got %#v", lines)
 	}
 }

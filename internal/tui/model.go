@@ -148,6 +148,18 @@ func (m *model) drainEvents() {
 	for {
 		select {
 		case e := <-m.sub:
+			if e.Type == core.EventProcessOutput {
+				tag := e.Stream
+				if tag == "" {
+					tag = "?"
+				}
+				who := string(e.ProcessID)
+				if e.ProcessName != "" {
+					who = e.ProcessName
+				}
+				m.appendLogLine(fmt.Sprintf("[%s|%s] %s", tag, who, e.Message))
+				continue
+			}
 			m.appendLogLine(fmt.Sprintf("[%s] %s %s", e.Type, e.ProcessID, e.Message))
 		default:
 			return

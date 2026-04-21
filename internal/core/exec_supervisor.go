@@ -1,9 +1,11 @@
 package core
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"sync"
@@ -52,6 +54,26 @@ func (s *ExecSupervisor) emit(id ProcessID, typ EventType, msg string) {
 		Timestamp: time.Now(),
 		Message:   msg,
 	})
+}
+
+func (s *ExecSupervisor) scanStream(r io.Reader, id ProcessID, name, stream string, wg *sync.WaitGroup) {
+	defer wg.Done()
+	sc := bufio.NewScanner(r)
+	buf := make([]byte, 0, 64*1024)
+	sc.Buffer(buf, 1024*1024)
+	for sc.Scan() {
+		s.bus.Publish(Event{
+			Type:        EventProcessOutput,
+			ProcessID:   id,
+			ProcessName: name,
+			Stream:      stream,
+			Timestamp:   time.Now(),
+			Message:     sc.Text(),
+		})
+	}
+	if err := sc.Err(); err != nil {
+		s.emitErr(id, fmt.Sprintf("output read error (%s): %v", stream, err))
+	}
 }
 
 func (s *ExecSupervisor) emitErr(id ProcessID, msg string) {
@@ -130,8 +152,29 @@ func (s *ExecSupervisor) Start(ctx context.Context, id ProcessID) error {
 	}
 	applySysProcAttr(cmd)
 
+	stdoutR, stdoutW, err := os.Pipe()
+	if err != nil {
+		cancel()
+		s.failStart(id, err)
+		return fmt.Errorf("start: stdout pipe: %w", err)
+	}
+	stderrR, stderrW, err := os.Pipe()
+	if err != nil {
+		cancel()
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
+		s.failStart(id, err)
+		return fmt.Errorf("start: stderr pipe: %w", err)
+	}
+	cmd.Stdout = stdoutW
+	cmd.Stderr = stderrW
+
 	if err := cmd.Start(); err != nil {
 		cancel()
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
+		_ = stderrR.Close()
+		_ = stderrW.Close()
 		s.failStart(id, err)
 		return fmt.Errorf("start: could not launch process %q: %w", id, err)
 	}
@@ -146,10 +189,21 @@ func (s *ExecSupervisor) Start(ctx context.Context, id ProcessID) error {
 
 	s.transition(id, EventProcessRunning, fmt.Sprintf("running pid=%d", p.pid))
 
+	var scanWg sync.WaitGroup
+	scanWg.Add(2)
+	procName := p.spec.Name
+	go p.sup.scanStream(stdoutR, id, procName, "o", &scanWg)
+	go p.sup.scanStream(stderrR, id, procName, "e", &scanWg)
+
 	go func() {
-		err := cmd.Wait()
+		waitErr := cmd.Wait()
 		cancel()
-		p.sup.handleWaitResult(p.id, err)
+		_ = stdoutW.Close()
+		_ = stderrW.Close()
+		scanWg.Wait()
+		_ = stdoutR.Close()
+		_ = stderrR.Close()
+		p.sup.handleWaitResult(p.id, waitErr)
 		close(waitDone)
 	}()
 

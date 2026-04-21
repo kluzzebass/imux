@@ -17,14 +17,18 @@ const (
 	// EventProcessError reports an operator-visible problem (illegal transition,
 	// unsupported platform operation, etc.) without implying a crashed child.
 	EventProcessError EventType = "process_error"
+	// EventProcessOutput is one logical line from a child stream (stdout/stderr).
+	EventProcessOutput EventType = "process_output"
 )
 
 // Event is emitted by supervisor components and consumed by UI/logging sinks.
 type Event struct {
-	Type      EventType
-	ProcessID ProcessID
-	Timestamp time.Time
-	Message   string
+	Type        EventType
+	ProcessID   ProcessID
+	ProcessName string // display name when known (e.g. for process_output lines)
+	Stream      string // "o" stdout, "e" stderr; empty for non-stream events
+	Timestamp   time.Time
+	Message     string
 }
 
 // EventBus is the publish/subscribe boundary between process control and UI.

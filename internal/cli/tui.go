@@ -1,8 +1,8 @@
 package cli
 
 import (
-	"imux/internal/tui"
 	"github.com/spf13/cobra"
+	"imux/internal/tui"
 )
 
 // NewTUICommand creates the interactive entrypoint.
