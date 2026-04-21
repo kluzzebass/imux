@@ -1,2 +1,27 @@
 .dogcats/config.local.toml
 .dogcats/.issues.lock
+
+# Go build artifacts
+bin/
+dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Coverage and profiling
+coverage.out
+coverage.html
+*.coverprofile
+*.pprof
+
+# Local environment/config
+.env
+.env.local
