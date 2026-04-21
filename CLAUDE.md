@@ -24,10 +24,31 @@ Always create issue branches with the issue ID in the branch name.
 
 ### Closing issues
 
-NEVER close issues without explicit user approval:
+NEVER close issues without explicit user approval.
 
-1. Set status to `in_review`
-2. Ask the user to test
-3. Ask if we can close it
-4. Only run `dcat close` after user confirms
-5. Upon closing, commit, merge, and push
+#### Required close sequence (strict, no reordering)
+
+Execute these steps in this exact order:
+
+1. Ensure issue status is `in_review`
+2. Ask user to test
+3. Ask user for explicit close approval ("can I close this issue?")
+4. Run `just close-issue --issue <issueId> --reason "<reason>" --commit-message "<message>" --approved yes` immediately after approval
+5. Do not run close steps manually if the helper exists
+6. Verify final state (`dcat show <issueId>` is `closed`, `git status` clean/on expected branch)
+
+#### Non-negotiable rules
+
+- Do not skip any step.
+- Do not reorder any step.
+- Never run `dcat close` directly when `scripts/close-issue.sh` is available.
+- Do not pause after the close command and wait for another user prompt.
+- Do not do unrelated work during the close transaction.
+- Treat close/commit/merge/push as one uninterrupted transaction.
+
+#### Forbidden order examples
+
+- Wrong: `dcat close` -> stop -> later commit/merge/push
+- Wrong: commit/merge/push -> then `dcat close`
+- Wrong: direct `dcat close` instead of `just close-issue ...`
+- Wrong: close without explicit user approval in this thread
