@@ -19,7 +19,6 @@ type overlayKind int
 
 const (
 	overlayNone overlayKind = iota
-	overlayProcesses
 	overlayInspector
 	overlayHelp
 )
@@ -29,9 +28,11 @@ type model struct {
 	height       int
 	overlay      overlayKind
 	helpReturnTo overlayKind
-	processes    []string
+	processes    []string // display names from ProcessSpec
+	dockCmd      []string // one-line shell command for dock (Command + Args)
 	ids          []core.ProcessID
 	selected     int
+	dockScroll   int // first visible row index when len(ids) > dock capacity
 	tick         int
 
 	sup    *core.ExecSupervisor
@@ -62,6 +63,120 @@ func demoLongCommand() (cmd string, args []string) {
 	return "sleep", []string{"86400"}
 }
 
+func formatExecLine(cmd string, args []string) string {
+	if len(args) == 0 {
+		return cmd
+	}
+	return cmd + " " + strings.Join(args, " ")
+}
+
+func (m *model) dockVisibleCount() int {
+	n := len(m.ids)
+	if n == 0 {
+		return 0
+	}
+	avail := m.height - 1 // footer row
+	if avail < 2 {
+		return min(9, n)
+	}
+	preferredLog := 3
+	cap := avail - preferredLog
+	if cap < 1 {
+		cap = 1
+	}
+	return min(9, n, cap)
+}
+
+func (m *model) clampDockScroll(visible int) {
+	if visible <= 0 || len(m.ids) == 0 {
+		m.dockScroll = 0
+		return
+	}
+	if len(m.ids) <= visible {
+		m.dockScroll = 0
+		return
+	}
+	maxScroll := len(m.ids) - visible
+	if m.dockScroll < 0 {
+		m.dockScroll = 0
+	}
+	if m.dockScroll > maxScroll {
+		m.dockScroll = maxScroll
+	}
+	if m.selected < m.dockScroll {
+		m.dockScroll = m.selected
+	}
+	if m.selected >= m.dockScroll+visible {
+		m.dockScroll = m.selected - visible + 1
+	}
+}
+
+// layoutHeights returns log row count and dock row count (footer is separate).
+func (m *model) layoutHeights() (logH, dockRows int) {
+	avail := m.height - 1
+	dockRows = m.dockVisibleCount()
+	m.clampDockScroll(dockRows)
+	logH = avail - dockRows
+	if logH < 1 {
+		logH = 1
+		if dockRows > avail-logH {
+			dockRows = max(0, avail-logH)
+			m.clampDockScroll(dockRows)
+		}
+	}
+	return logH, dockRows
+}
+
+func (m *model) renderDock(dockRows int) string {
+	if dockRows <= 0 || len(m.ids) == 0 {
+		return ""
+	}
+	w := m.width
+	if w < 1 {
+		w = 1
+	}
+	selStyle := lipgloss.NewStyle().Background(lipgloss.Color("235")).Foreground(lipgloss.Color("252")).Width(w)
+	lines := make([]string, 0, dockRows)
+	for r := 0; r < dockRows; r++ {
+		idx := m.dockScroll + r
+		if idx >= len(m.ids) {
+			break
+		}
+		id := m.ids[idx]
+		st := "(?)"
+		if s, ok := m.store.Get(id); ok {
+			st = string(s)
+		}
+		hot := "· "
+		if idx < 9 {
+			hot = fmt.Sprintf("%d ", idx+1)
+		}
+		cmd := ""
+		if idx < len(m.dockCmd) {
+			cmd = m.dockCmd[idx]
+		}
+		suffix := fmt.Sprintf(" [%s]", st)
+		bar := "  "
+		if idx == m.selected {
+			bar = "▌ "
+		}
+		prefix := hot + bar
+		cmdBudget := w - lipgloss.Width(prefix) - lipgloss.Width(suffix)
+		if cmdBudget < 4 {
+			cmdBudget = 4
+		}
+		cmdShown := truncate(cmd, cmdBudget)
+		raw := prefix + cmdShown + suffix
+		raw = padRight(truncate(raw, w), w)
+		line := raw
+		if idx == m.selected {
+			line = selStyle.Render(raw)
+		}
+		lines = append(lines, line)
+	}
+	return strings.Join(lines, "\n")
+}
+
 func newModel() *model {
 	bus := core.NewChanEventBus()
 	store := core.NewMapStateStore()
@@ -88,6 +203,7 @@ func newModel() *model {
 
 	names := make([]string, 0, len(demos))
 	ids := make([]core.ProcessID, 0, len(demos))
+	dock := make([]string, 0, len(demos))
 	for _, d := range demos {
 		id := core.ProcessID(d.id)
 		args := []string{shArg, inner}
@@ -103,6 +219,7 @@ func newModel() *model {
 		})
 		names = append(names, d.name)
 		ids = append(ids, id)
+		dock = append(dock, formatExecLine(shCmd, args))
 	}
 
 	return &model{
@@ -111,9 +228,10 @@ func newModel() *model {
 		bus:       bus,
 		sub:       bus.Subscribe(512),
 		processes: names,
+		dockCmd:   dock,
 		ids:       ids,
 		selected:  0,
-		events:    []string{"[o] (imux) lifecycle log — start processes with s; errors appear here and on stderr from imux run."},
+		events:    []string{"[o] (imux) merged log — dock below: ↑↓ select, 1–9 jump, s/t/k/z/v/y on the selected process."},
 	}
 }
 
@@ -129,6 +247,16 @@ func (m *model) currentName() string {
 		return ""
 	}
 	return m.processes[m.selected]
+}
+
+func (m *model) dockLineForSelected() string {
+	if m.selected >= 0 && m.selected < len(m.dockCmd) {
+		return m.dockCmd[m.selected]
+	}
+	if m.currentID() != "" {
+		return string(m.currentID())
+	}
+	return ""
 }
 
 func (m *model) appendLogLine(line string) {
@@ -219,11 +347,14 @@ func (m *model) refreshProcs() {
 	sort.Slice(specs, func(i, j int) bool { return specs[i].ID < specs[j].ID })
 	names := make([]string, len(specs))
 	ids := make([]core.ProcessID, len(specs))
+	dock := make([]string, len(specs))
 	for i, sp := range specs {
 		names[i] = sp.Name
 		ids[i] = sp.ID
+		dock[i] = formatExecLine(sp.Command, sp.Args)
 	}
 	m.processes = names
+	m.dockCmd = dock
 	m.ids = ids
 	if m.selected >= len(m.ids) {
 		m.selected = len(m.ids) - 1
@@ -231,6 +362,7 @@ func (m *model) refreshProcs() {
 	if m.selected < 0 {
 		m.selected = 0
 	}
+	m.clampDockScroll(m.dockVisibleCount())
 }
 
 func (m *model) shutdownProcs() {
@@ -266,11 +398,21 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.clampDockScroll(m.dockVisibleCount())
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c", "q":
 			m.shutdownProcs()
 			return m, tea.Quit
+		case "1", "2", "3", "4", "5", "6", "7", "8", "9":
+			if m.overlay == overlayHelp {
+				break
+			}
+			idx := int(msg.String()[0] - '1')
+			if idx < len(m.ids) {
+				m.selected = idx
+				m.clampDockScroll(m.dockVisibleCount())
+			}
 		case "?":
 			if m.overlay == overlayHelp {
 				m.overlay = m.helpReturnTo
@@ -285,15 +427,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.helpReturnTo = overlayNone
 			} else if m.overlay != overlayNone {
 				m.overlay = overlayNone
-			}
-		case "p":
-			if m.overlay == overlayHelp {
-				break
-			}
-			if m.overlay == overlayProcesses {
-				m.overlay = overlayNone
-			} else {
-				m.overlay = overlayProcesses
 			}
 		case "i":
 			if m.overlay == overlayHelp {
@@ -313,18 +446,15 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.overlay == overlayHelp {
 				break
 			}
-			if m.overlay == overlayProcesses && m.selected > 0 {
+			if m.selected > 0 {
 				m.selected--
+				m.clampDockScroll(m.dockVisibleCount())
 			}
 		case "k":
 			if m.overlay == overlayHelp {
 				break
 			}
-			if m.overlay == overlayProcesses && m.selected > 0 {
-				m.selected--
-				break
-			}
-			if m.overlay == overlayNone && m.sup != nil {
+			if m.sup != nil {
 				ctx := context.Background()
 				if id := m.currentID(); id != "" {
 					m.appendCtlErr("kill", m.sup.Kill(ctx, id))
@@ -334,40 +464,31 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.overlay == overlayHelp {
 				break
 			}
-			if m.overlay == overlayProcesses && m.selected < len(m.processes)-1 {
+			if m.selected < len(m.processes)-1 {
 				m.selected++
-			}
-		case "j":
-			if m.overlay == overlayHelp {
-				break
-			}
-			if m.overlay == overlayProcesses && m.selected < len(m.processes)-1 {
-				m.selected++
-				break
-			}
-		case "enter":
-			if m.overlay == overlayHelp {
-				break
-			}
-			if m.overlay == overlayProcesses {
-				m.overlay = overlayNone
+				m.clampDockScroll(m.dockVisibleCount())
 			}
 		case ",", "<":
 			if m.overlay == overlayHelp {
 				break
 			}
-			if m.overlay == overlayNone && m.selected > 0 {
+			if m.selected > 0 {
 				m.selected--
+				m.clampDockScroll(m.dockVisibleCount())
 			}
 		case ".", ">":
 			if m.overlay == overlayHelp {
 				break
 			}
-			if m.overlay == overlayNone && m.selected < len(m.processes)-1 {
+			if m.selected < len(m.processes)-1 {
 				m.selected++
+				m.clampDockScroll(m.dockVisibleCount())
 			}
 		default:
-			if m.overlay == overlayNone && m.sup != nil {
+			if m.overlay == overlayHelp {
+				break
+			}
+			if m.sup != nil {
 				ctx := context.Background()
 				id := m.currentID()
 				if id == "" {
@@ -397,22 +518,24 @@ func (m *model) View() string {
 		return "Terminal too small for imux TUI (need at least 40x8). Press q to quit."
 	}
 
-	footerH := 1
-	bodyH := m.height - footerH
-	if bodyH < 3 {
-		bodyH = 3
+	logH, dockRows := m.layoutHeights()
+	logBlock := m.renderBody(logH)
+	if dockRows > 0 {
+		logBlock = lipgloss.JoinVertical(lipgloss.Left, logBlock, m.renderDock(dockRows))
 	}
 
-	body := m.renderBody(bodyH)
-	footer := m.renderFooter()
-
+	bodyH := m.height - 1
+	if bodyH < 1 {
+		bodyH = 1
+	}
 	if m.overlay != overlayNone {
 		modal := m.renderModal()
-		body = compositeLogWithModal(body, modal, m.width, bodyH)
+		logBlock = compositeLogWithModal(logBlock, modal, m.width, bodyH)
 	}
 
+	footer := m.renderFooter()
 	footerStyled := lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render(footer)
-	return lipgloss.JoinVertical(lipgloss.Left, body, footerStyled)
+	return lipgloss.JoinVertical(lipgloss.Left, logBlock, footerStyled)
 }
 
 func (m *model) renderFooter() string {
@@ -421,18 +544,21 @@ func (m *model) renderFooter() string {
 	switch m.overlay {
 	case overlayHelp:
 		if m.helpReturnTo == overlayNone {
-			s = "Help — Esc or ? closes. s start · t stop · k kill · z pause · v continue · y restart · p list · i inspector · , . focus · q quit."
+			s = "Help — Esc or ? closes. Dock: ↑↓ select · 1–9 jump · s t k z v y · i inspector · ? · q quit."
 		} else {
 			s = "Help — Esc or ? returns to the previous panel."
 		}
-	case overlayProcesses:
-		s = "Processes — j/k move, Enter closes. ? help."
 	case overlayInspector:
 		s = fmt.Sprintf("Inspector — %s · r refresh · Esc closes · ? help.", proc)
 	default:
+		snippet := m.dockLineForSelected()
+		if snippet == "" {
+			snippet = m.currentName()
+		}
+		maxSnip := min(24, max(4, m.width/3))
 		s = fmt.Sprintf(
-			"%s — s start t stop k kill z pause v continue y restart · p i ? · q quit",
-			proc,
+			"%s — ↑↓ · 1-9 · s t k z v y · i ? · q",
+			truncate(snippet, maxSnip),
 		)
 	}
 	return padRight(truncate(s, m.width), m.width)
@@ -536,24 +662,16 @@ func (m *model) renderModal() string {
 			"event bus (errors are prefixed with [error]).",
 			"",
 			"Keys:",
+			"  ↑ ↓           move selection in the bottom dock",
+			"  1-9           jump to process slot (first nine)",
 			"  s t k z v y   start / stop / kill / pause / continue / restart",
-			"  , or .        previous / next process",
-			"  p i           process list · inspector (r refreshes)",
+			"  , or .        previous / next process (same as arrows)",
+			"  i             inspector overlay (r refreshes)",
 			"  ? Esc         help · close overlay",
 			"  q Ctrl+c      quit (stops running demos)",
 			"",
 			fmt.Sprintf("Focus: %s (%s)", proc, m.currentID()),
 		}
-	case overlayProcesses:
-		title = "Processes"
-		for i, name := range m.processes {
-			prefix := "  "
-			if i == m.selected {
-				prefix = "> "
-			}
-			bodyLines = append(bodyLines, prefix+name)
-		}
-		bodyLines = append(bodyLines, "", "Enter closes · ? help")
 	case overlayInspector:
 		title = "Inspector"
 		bodyLines = append(append([]string(nil), m.inspectLines...), "", "Esc closes · r refresh · ? help")
@@ -586,13 +704,6 @@ func (m *model) renderModal() string {
 		Width(innerW)
 
 	return style.Render(strings.Join(all, "\n"))
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 func truncate(s string, maxWidth int) string {
