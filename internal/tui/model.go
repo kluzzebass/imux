@@ -529,19 +529,18 @@ func (m *model) View() string {
 }
 
 func (m *model) renderFooter() string {
-	proc := m.currentName()
 	var s string
 	switch m.overlay {
 	case overlayHelp:
 		if m.helpReturnTo == overlayNone {
-			s = "Help — Esc or ? closes. Dock: ↑↓ select · 1–9 jump · s t k z v y · i inspector · ? · q quit."
+			s = "Esc or ? closes help"
 		} else {
-			s = "Help — Esc or ? returns to the previous panel."
+			s = "Esc or ? returns"
 		}
 	case overlayInspector:
-		s = fmt.Sprintf("Inspector — %s · r refresh · Esc closes · ? help.", proc)
+		s = "Esc closes · r refresh"
 	default:
-		s = "↑↓ · 1-9 · s t k z v y · i ? · q"
+		s = "? help · q quit"
 	}
 	return padRight(truncate(s, m.width), m.width)
 }
