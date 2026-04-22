@@ -4,6 +4,7 @@ import (
 	"runtime"
 	"testing"
 
+	"github.com/charmbracelet/lipgloss"
 	"imux/internal/core"
 )
 
@@ -59,6 +60,15 @@ func TestInnerCommandForEditNonWrap(t *testing.T) {
 	sp := core.ProcessSpec{Command: "sleep", Args: []string{"1"}}
 	if got := innerCommandForEdit(sp); got != "sleep 1" {
 		t.Fatalf("got %q", got)
+	}
+}
+
+func TestPrefixedInputLineCaretWidth(t *testing.T) {
+	t.Parallel()
+	const innerW = 40
+	line := prefixedInputLine("> Name: ", "foo", innerW, true, 0)
+	if lipgloss.Width(line) > innerW {
+		t.Fatalf("line wider than innerW: %d > %d", lipgloss.Width(line), innerW)
 	}
 }
 

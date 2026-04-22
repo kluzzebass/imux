@@ -135,7 +135,29 @@ func sanitizeDisplayName(s string) string {
 	return truncate(s, 48)
 }
 
-func lineFormModalBody(innerW, field int, nameBuf, cmdBuf, footer string) []string {
+// prefixedInputLine draws prefix + truncated buffer + optional blinking caret for the active field.
+func prefixedInputLine(prefix, buf string, innerW int, active bool, tick int) string {
+	pw := lipgloss.Width(prefix)
+	maxBuf := innerW - pw
+	if maxBuf < 1 {
+		return truncate(prefix, innerW)
+	}
+	if !active {
+		return prefix + truncate(buf, maxBuf)
+	}
+	caret := "▏"
+	if tick%2 == 1 {
+		caret = " "
+	}
+	cw := lipgloss.Width(caret)
+	textW := maxBuf - cw
+	if textW < 1 {
+		textW = 1
+	}
+	return prefix + truncate(buf, textW) + caret
+}
+
+func lineFormModalBody(innerW, field, tick int, nameBuf, cmdBuf, footer string) []string {
 	nameMark := "  "
 	cmdMark := "  "
 	if field == lineFormNameField {
@@ -145,19 +167,13 @@ func lineFormModalBody(innerW, field int, nameBuf, cmdBuf, footer string) []stri
 	}
 	nPrefix := nameMark + "Name: "
 	cPrefix := cmdMark + "$ "
-	nb := innerW - lipgloss.Width(nPrefix)
-	if nb < 4 {
-		nb = 4
-	}
-	cb := innerW - lipgloss.Width(cPrefix)
-	if cb < 4 {
-		cb = 4
-	}
+	nameLine := prefixedInputLine(nPrefix, nameBuf, innerW, field == lineFormNameField, tick)
+	cmdLine := prefixedInputLine(cPrefix, cmdBuf, innerW, field == lineFormCmdField, tick)
 	return []string{
 		"Tab switches name / command.",
 		"",
-		nPrefix + truncate(nameBuf, nb),
-		cPrefix + truncate(cmdBuf, cb),
+		nameLine,
+		cmdLine,
 		"",
 		footer,
 	}
@@ -1063,11 +1079,11 @@ func (m *model) renderModal() string {
 	case overlayAddProcess:
 		title = "New process"
 		bodyLines = append([]string{"Wrapped like imux run (sh -c or cmd /C)."},
-			lineFormModalBody(innerW, m.lineOverlayField, m.addNameBuf, m.addBuf, "Esc cancel · Enter register+start")...)
+			lineFormModalBody(innerW, m.lineOverlayField, m.tick, m.addNameBuf, m.addBuf, "Esc cancel · Enter register+start")...)
 	case overlayEditProcess:
 		title = "Edit process"
 		bodyLines = append([]string{fmt.Sprintf("id %s — same slot.", m.editTargetID)},
-			lineFormModalBody(innerW, m.lineOverlayField, m.editNameBuf, m.editBuf, "Esc cancel · Enter save (re-register + start)")...)
+			lineFormModalBody(innerW, m.lineOverlayField, m.tick, m.editNameBuf, m.editBuf, "Esc cancel · Enter save (re-register + start)")...)
 	default:
 		title = ""
 		bodyLines = nil
