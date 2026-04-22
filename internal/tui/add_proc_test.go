@@ -30,3 +30,10 @@ func TestNameFromCommandLine(t *testing.T) {
 		t.Fatalf("fields: %q", got)
 	}
 }
+
+func TestSanitizeDisplayName(t *testing.T) {
+	t.Parallel()
+	if got := sanitizeDisplayName("  foo\nbar  "); got != "foo bar" {
+		t.Fatalf("got %q", got)
+	}
+}

@@ -47,10 +47,13 @@ type model struct {
 	inspectCPU     *inspect.CPUSample
 	inspectFocusID core.ProcessID
 
-	addBuf       string
-	nextUserSeq  int
-	editBuf      string
-	editTargetID core.ProcessID
+	addBuf           string
+	addNameBuf       string
+	nextUserSeq      int
+	editBuf          string
+	editNameBuf      string
+	editTargetID     core.ProcessID
+	lineOverlayField int // lineFormNameField or lineFormCmdField
 }
 
 type tickMsg time.Time
@@ -102,6 +105,47 @@ func nameFromCommandLine(line string) string {
 		return truncate(n, 32)
 	}
 	return truncate(fields[0], 32)
+}
+
+// lineFormNameField / lineFormCmdField are focused buffers in add/edit overlays.
+const (
+	lineFormNameField = 0
+	lineFormCmdField  = 1
+)
+
+func sanitizeDisplayName(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.ReplaceAll(s, "\r", "")
+	return truncate(s, 48)
+}
+
+func lineFormModalBody(innerW, field int, nameBuf, cmdBuf, footer string) []string {
+	nameMark := "  "
+	cmdMark := "  "
+	if field == lineFormNameField {
+		nameMark = "> "
+	} else {
+		cmdMark = "> "
+	}
+	nPrefix := nameMark + "Name: "
+	cPrefix := cmdMark + "$ "
+	nb := innerW - lipgloss.Width(nPrefix)
+	if nb < 4 {
+		nb = 4
+	}
+	cb := innerW - lipgloss.Width(cPrefix)
+	if cb < 4 {
+		cb = 4
+	}
+	return []string{
+		"Tab switches name / command.",
+		"",
+		nPrefix + truncate(nameBuf, nb),
+		cPrefix + truncate(cmdBuf, cb),
+		"",
+		footer,
+	}
 }
 
 func (m *model) dockVisibleCount() int {
@@ -265,7 +309,7 @@ func newModel() *model {
 		dockCmd:   dock,
 		ids:       ids,
 		selected:  0,
-		events:    []string{"[o] (imux) merged log — n new · e edit (when stopped) · dock: ↑↓ 1–9 · Enter inspector · s/t/k/z/v/y."},
+		events:    []string{"[o] (imux) merged log — n new (name+shell, Tab) · e edit · dock ↑↓ 1–9 · Enter inspector · s/t/k/z/v/y."},
 	}
 }
 
@@ -372,7 +416,13 @@ func (m *model) tryAddProcess() {
 	}
 	sh, shellArgs := shellWrapUserCommand(line)
 	ctx := context.Background()
-	name := nameFromCommandLine(line)
+	name := sanitizeDisplayName(m.addNameBuf)
+	if name == "" {
+		name = nameFromCommandLine(line)
+	}
+	if name == "" {
+		name = "proc"
+	}
 	for tries := 0; tries < 64; tries++ {
 		m.nextUserSeq++
 		id := core.ProcessID(fmt.Sprintf("u%d", m.nextUserSeq))
@@ -403,8 +453,7 @@ func (m *model) tryAddProcess() {
 				break
 			}
 		}
-		m.addBuf = ""
-		m.overlay = overlayNone
+		m.resetLineOverlay()
 		return
 	}
 	m.appendLogLine("[error] add process: could not allocate id")
@@ -412,8 +461,11 @@ func (m *model) tryAddProcess() {
 
 func (m *model) resetLineOverlay() {
 	m.addBuf = ""
+	m.addNameBuf = ""
 	m.editBuf = ""
+	m.editNameBuf = ""
 	m.editTargetID = ""
+	m.lineOverlayField = lineFormNameField
 	m.overlay = overlayNone
 }
 
@@ -461,7 +513,13 @@ func (m *model) tryEditProcess() {
 		return
 	}
 	sh, shellArgs := shellWrapUserCommand(line)
-	name := nameFromCommandLine(line)
+	name := sanitizeDisplayName(m.editNameBuf)
+	if name == "" {
+		name = nameFromCommandLine(line)
+	}
+	if name == "" {
+		name = "proc"
+	}
 	spec := core.ProcessSpec{
 		ID:      id,
 		Name:    name,
@@ -580,35 +638,65 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			case "backspace":
 				if edit {
-					m.editBuf = trimLastRune(m.editBuf)
+					if m.lineOverlayField == lineFormNameField {
+						m.editNameBuf = trimLastRune(m.editNameBuf)
+					} else {
+						m.editBuf = trimLastRune(m.editBuf)
+					}
 				} else {
-					m.addBuf = trimLastRune(m.addBuf)
+					if m.lineOverlayField == lineFormNameField {
+						m.addNameBuf = trimLastRune(m.addNameBuf)
+					} else {
+						m.addBuf = trimLastRune(m.addBuf)
+					}
 				}
 			case "tab":
-				if edit {
-					m.editBuf += "    "
+				if m.lineOverlayField == lineFormNameField {
+					m.lineOverlayField = lineFormCmdField
 				} else {
-					m.addBuf += "    "
+					m.lineOverlayField = lineFormNameField
 				}
 			default:
 				switch msg.Type {
 				case tea.KeyRunes:
 					if edit {
-						m.editBuf += string(msg.Runes)
-						if len(m.editBuf) > 4000 {
-							m.editBuf = m.editBuf[:4000]
+						if m.lineOverlayField == lineFormNameField {
+							m.editNameBuf += string(msg.Runes)
+							if len(m.editNameBuf) > 256 {
+								m.editNameBuf = m.editNameBuf[:256]
+							}
+						} else {
+							m.editBuf += string(msg.Runes)
+							if len(m.editBuf) > 4000 {
+								m.editBuf = m.editBuf[:4000]
+							}
 						}
 					} else {
-						m.addBuf += string(msg.Runes)
-						if len(m.addBuf) > 4000 {
-							m.addBuf = m.addBuf[:4000]
+						if m.lineOverlayField == lineFormNameField {
+							m.addNameBuf += string(msg.Runes)
+							if len(m.addNameBuf) > 256 {
+								m.addNameBuf = m.addNameBuf[:256]
+							}
+						} else {
+							m.addBuf += string(msg.Runes)
+							if len(m.addBuf) > 4000 {
+								m.addBuf = m.addBuf[:4000]
+							}
 						}
 					}
 				case tea.KeySpace:
 					if edit {
-						m.editBuf += " "
+						if m.lineOverlayField == lineFormNameField {
+							m.editNameBuf += " "
+						} else {
+							m.editBuf += " "
+						}
 					} else {
-						m.addBuf += " "
+						if m.lineOverlayField == lineFormNameField {
+							m.addNameBuf += " "
+						} else {
+							m.addBuf += " "
+						}
 					}
 				}
 			}
@@ -654,6 +742,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.overlay = overlayAddProcess
 			m.addBuf = ""
+			m.addNameBuf = ""
+			m.lineOverlayField = lineFormNameField
 		case "e":
 			if m.overlay == overlayHelp {
 				break
@@ -679,6 +769,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				m.editBuf = string(id)
 			}
+			m.editNameBuf = ""
+			if m.selected >= 0 && m.selected < len(m.processes) {
+				m.editNameBuf = m.processes[m.selected]
+			}
+			m.lineOverlayField = lineFormNameField
 			m.overlay = overlayEditProcess
 		case "enter":
 			if m.overlay == overlayHelp {
@@ -896,7 +991,7 @@ func (m *model) renderModal() string {
 	}
 	if m.overlay == overlayAddProcess || m.overlay == overlayEditProcess {
 		maxW = min(72, m.width-4)
-		maxH = min(12, m.height-4)
+		maxH = min(16, m.height-4)
 	}
 	if maxW < 24 {
 		maxW = 24
@@ -930,8 +1025,8 @@ func (m *model) renderModal() string {
 			"  s t k z v y   start / stop / kill / pause / continue / restart",
 			"  , or .        previous / next process (same as arrows)",
 			"  Enter or i    inspector (Esc or Enter closes, r refreshes)",
-			"  n             new process (shell command, Esc/Enter in form)",
-			"  e             edit command (process must be stopped)",
+			"  n             new process (name + command, Tab switches field)",
+			"  e             edit name + command (process must be stopped)",
 			"  ? Esc         help · close overlay",
 			"  q Ctrl+c      quit (stops running demos)",
 			"",
@@ -942,40 +1037,12 @@ func (m *model) renderModal() string {
 		bodyLines = append(append([]string(nil), m.inspectLines...), "", "Esc or Enter closes · r refresh · ? help")
 	case overlayAddProcess:
 		title = "New process"
-		prompt := m.addBuf
-		prefix := "$ "
-		budget := innerW - lipgloss.Width(prefix)
-		if budget < 4 {
-			budget = 4
-		}
-		if lipgloss.Width(prompt) > budget {
-			prompt = truncate(prompt, budget)
-		}
-		bodyLines = []string{
-			"Shell one-liner (same wrapping as imux run).",
-			"",
-			prefix + prompt,
-			"",
-			"Esc cancel · Enter register+start",
-		}
+		bodyLines = append([]string{"Wrapped like imux run (sh -c or cmd /C)."},
+			lineFormModalBody(innerW, m.lineOverlayField, m.addNameBuf, m.addBuf, "Esc cancel · Enter register+start")...)
 	case overlayEditProcess:
 		title = "Edit process"
-		prompt := m.editBuf
-		prefix := "$ "
-		budget := innerW - lipgloss.Width(prefix)
-		if budget < 4 {
-			budget = 4
-		}
-		if lipgloss.Width(prompt) > budget {
-			prompt = truncate(prompt, budget)
-		}
-		bodyLines = []string{
-			fmt.Sprintf("id %s — same slot, replaces command.", m.editTargetID),
-			"",
-			prefix + prompt,
-			"",
-			"Esc cancel · Enter save (re-register + start)",
-		}
+		bodyLines = append([]string{fmt.Sprintf("id %s — same slot.", m.editTargetID)},
+			lineFormModalBody(innerW, m.lineOverlayField, m.editNameBuf, m.editBuf, "Esc cancel · Enter save (re-register + start)")...)
 	default:
 		title = ""
 		bodyLines = nil
