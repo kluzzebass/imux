@@ -569,11 +569,7 @@ func (m *model) tryEditProcess() {
 		m.resetLineOverlay()
 		return
 	}
-	if err := m.sup.Start(ctx, id); err != nil {
-		m.appendLogLine(fmt.Sprintf("[error] edit process %s: start failed (registered, use s): %v", id, err))
-	} else {
-		m.appendLogLine(fmt.Sprintf("[ok] updated process %s (%s)", id, name))
-	}
+	m.appendLogLine(fmt.Sprintf("[ok] updated definition for %s (%s); press s when you want it running", id, name))
 	m.refreshProcs()
 	for i, pid := range m.ids {
 		if pid == id {
@@ -952,7 +948,7 @@ func (m *model) renderFooter() string {
 	case overlayAddProcess:
 		s = "Esc cancels · Enter adds"
 	case overlayEditProcess:
-		s = "Esc cancels · Enter saves"
+		s = "Esc cancels · Enter saves · s starts"
 	default:
 		s = "? help · q quit"
 	}
@@ -1067,7 +1063,7 @@ func (m *model) renderModal() string {
 			"  , or .        previous / next process (same as arrows)",
 			"  Enter or i    inspector (Esc or Enter closes, r refreshes)",
 			"  n             new process (name + command, Tab switches field)",
-			"  e             edit name + command (process must be stopped)",
+			"  e             edit name + command (stop first; Enter saves, then s to run)",
 			"  ? Esc         help · close overlay",
 			"  q Ctrl+c      quit (stops running demos)",
 			"",
@@ -1083,7 +1079,7 @@ func (m *model) renderModal() string {
 	case overlayEditProcess:
 		title = "Edit process"
 		bodyLines = append([]string{fmt.Sprintf("id %s — same slot.", m.editTargetID)},
-			lineFormModalBody(innerW, m.lineOverlayField, m.tick, m.editNameBuf, m.editBuf, "Esc cancel · Enter save (re-register + start)")...)
+			lineFormModalBody(innerW, m.lineOverlayField, m.tick, m.editNameBuf, m.editBuf, "Esc cancel · Enter save (pending — s to start)")...)
 	default:
 		title = ""
 		bodyLines = nil
