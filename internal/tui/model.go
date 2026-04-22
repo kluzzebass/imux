@@ -21,6 +21,7 @@ const (
 	overlayNone overlayKind = iota
 	overlayInspector
 	overlayHelp
+	overlayAddProcess
 )
 
 type model struct {
@@ -44,6 +45,9 @@ type model struct {
 	inspectLines   []string
 	inspectCPU     *inspect.CPUSample
 	inspectFocusID core.ProcessID
+
+	addBuf      string
+	nextUserSeq int
 }
 
 type tickMsg time.Time
@@ -68,6 +72,33 @@ func formatExecLine(cmd string, args []string) string {
 		return cmd
 	}
 	return cmd + " " + strings.Join(args, " ")
+}
+
+func shellWrapUserCommand(script string) (cmd string, args []string) {
+	if runtime.GOOS == "windows" {
+		return "cmd.exe", []string{"/C", script}
+	}
+	return "sh", []string{"-c", script}
+}
+
+func trimLastRune(s string) string {
+	if s == "" {
+		return ""
+	}
+	r := []rune(s)
+	return string(r[:len(r)-1])
+}
+
+func nameFromCommandLine(line string) string {
+	fields := strings.Fields(line)
+	if len(fields) == 0 {
+		n := strings.TrimSpace(line)
+		if n == "" {
+			return "proc"
+		}
+		return truncate(n, 32)
+	}
+	return truncate(fields[0], 32)
 }
 
 func (m *model) dockVisibleCount() int {
@@ -231,7 +262,7 @@ func newModel() *model {
 		dockCmd:   dock,
 		ids:       ids,
 		selected:  0,
-		events:    []string{"[o] (imux) merged log — dock: ↑↓ 1–9 select · Enter inspector · s/t/k/z/v/y lifecycle."},
+		events:    []string{"[o] (imux) merged log — n new process · dock: ↑↓ 1–9 · Enter inspector · s/t/k/z/v/y."},
 	}
 }
 
@@ -326,6 +357,56 @@ func (m *model) drainEvents() {
 	}
 }
 
+func (m *model) tryAddProcess() {
+	line := strings.TrimSpace(m.addBuf)
+	if line == "" {
+		m.appendLogLine("[error] add process: empty command")
+		return
+	}
+	if m.sup == nil {
+		m.appendLogLine("[error] add process: no supervisor")
+		return
+	}
+	sh, shellArgs := shellWrapUserCommand(line)
+	ctx := context.Background()
+	name := nameFromCommandLine(line)
+	for tries := 0; tries < 64; tries++ {
+		m.nextUserSeq++
+		id := core.ProcessID(fmt.Sprintf("u%d", m.nextUserSeq))
+		spec := core.ProcessSpec{
+			ID:      id,
+			Name:    name,
+			Command: sh,
+			Args:    shellArgs,
+			Restart: core.RestartConfig{Policy: core.RestartNever},
+		}
+		err := m.sup.Register(ctx, spec)
+		if err != nil {
+			if strings.Contains(err.Error(), "already exists") {
+				continue
+			}
+			m.appendLogLine(fmt.Sprintf("[error] add process: register: %v", err))
+			return
+		}
+		if err := m.sup.Start(ctx, id); err != nil {
+			m.appendLogLine(fmt.Sprintf("[error] add process %s: start failed (registered, use s to retry): %v", id, err))
+		} else {
+			m.appendLogLine(fmt.Sprintf("[ok] added process %s (%s)", id, name))
+		}
+		m.refreshProcs()
+		for i, pid := range m.ids {
+			if pid == id {
+				m.selected = i
+				break
+			}
+		}
+		m.addBuf = ""
+		m.overlay = overlayNone
+		return
+	}
+	m.appendLogLine("[error] add process: could not allocate id")
+}
+
 func (m *model) refreshProcs() {
 	if m.sup == nil {
 		return
@@ -390,6 +471,38 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		m.clampDockScroll(m.dockVisibleCount())
 	case tea.KeyMsg:
+		if m.overlay == overlayAddProcess {
+			if msg.String() == "?" {
+				m.helpReturnTo = overlayAddProcess
+				m.overlay = overlayHelp
+				return m, nil
+			}
+			switch msg.String() {
+			case "ctrl+c":
+				m.shutdownProcs()
+				return m, tea.Quit
+			case "esc":
+				m.addBuf = ""
+				m.overlay = overlayNone
+			case "enter":
+				m.tryAddProcess()
+			case "backspace":
+				m.addBuf = trimLastRune(m.addBuf)
+			case "tab":
+				m.addBuf += "    "
+			default:
+				switch msg.Type {
+				case tea.KeyRunes:
+					m.addBuf += string(msg.Runes)
+					if len(m.addBuf) > 4000 {
+						m.addBuf = m.addBuf[:4000]
+					}
+				case tea.KeySpace:
+					m.addBuf += " "
+				}
+			}
+			return m, nil
+		}
 		switch msg.String() {
 		case "ctrl+c", "q":
 			m.shutdownProcs()
@@ -418,6 +531,18 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else if m.overlay != overlayNone {
 				m.overlay = overlayNone
 			}
+		case "n":
+			if m.overlay == overlayHelp {
+				break
+			}
+			if m.overlay == overlayInspector {
+				m.overlay = overlayNone
+			}
+			if m.overlay == overlayAddProcess {
+				break
+			}
+			m.overlay = overlayAddProcess
+			m.addBuf = ""
 		case "enter":
 			if m.overlay == overlayHelp {
 				break
@@ -551,6 +676,8 @@ func (m *model) renderFooter() string {
 		}
 	case overlayInspector:
 		s = "Esc or Enter closes · r refresh"
+	case overlayAddProcess:
+		s = "Esc cancels · Enter adds"
 	default:
 		s = "? help · q quit"
 	}
@@ -628,6 +755,10 @@ func (m *model) renderModal() string {
 		maxW = min(72, m.width-4)
 		maxH = min(22, m.height-4)
 	}
+	if m.overlay == overlayAddProcess {
+		maxW = min(72, m.width-4)
+		maxH = min(12, m.height-4)
+	}
 	if maxW < 24 {
 		maxW = 24
 	}
@@ -660,6 +791,7 @@ func (m *model) renderModal() string {
 			"  s t k z v y   start / stop / kill / pause / continue / restart",
 			"  , or .        previous / next process (same as arrows)",
 			"  Enter or i    inspector (Esc or Enter closes, r refreshes)",
+			"  n             new process (shell command, Esc/Enter in form)",
 			"  ? Esc         help · close overlay",
 			"  q Ctrl+c      quit (stops running demos)",
 			"",
@@ -668,8 +800,27 @@ func (m *model) renderModal() string {
 	case overlayInspector:
 		title = "Inspector"
 		bodyLines = append(append([]string(nil), m.inspectLines...), "", "Esc or Enter closes · r refresh · ? help")
+	case overlayAddProcess:
+		title = "New process"
+		prompt := m.addBuf
+		prefix := "$ "
+		budget := innerW - lipgloss.Width(prefix)
+		if budget < 4 {
+			budget = 4
+		}
+		if lipgloss.Width(prompt) > budget {
+			prompt = truncate(prompt, budget)
+		}
+		bodyLines = []string{
+			"Shell one-liner (same wrapping as imux run).",
+			"",
+			prefix + prompt,
+			"",
+			"Esc cancel · Enter register+start",
+		}
 	default:
 		title = ""
+		bodyLines = nil
 	}
 
 	bodyRows := innerLines - 1
