@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "hooks": {
+    "beforeShellExecution": [
+      {
+        "command": "python3 .cursor/hooks/guard_issue_close.py",
+        "failClosed": true,
+        "timeout": 5
+      }
+    ]
+  }
+}

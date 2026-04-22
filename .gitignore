@@ -25,3 +25,7 @@ coverage.html
 # Local environment/config
 .env
 .env.local
+
+# vscode/cursor
+.vscode/
+*.code-workspace
