@@ -264,18 +264,38 @@ func (m *model) renderDock(dockRows int) string {
 		if idx < len(m.dockCmd) {
 			cmd = m.dockCmd[idx]
 		}
+		name := ""
+		if idx < len(m.processes) {
+			name = m.processes[idx]
+		}
+		if name == "" {
+			name = string(id)
+		}
 		suffix := fmt.Sprintf(" [%s]", st)
 		bar := "  "
 		if idx == m.selected {
 			bar = "▌ "
 		}
 		prefix := hot + bar
-		cmdBudget := w - lipgloss.Width(prefix) - lipgloss.Width(suffix)
-		if cmdBudget < 4 {
-			cmdBudget = 4
+		sep := " · "
+		sepW := lipgloss.Width(sep)
+		midBudget := w - lipgloss.Width(prefix) - lipgloss.Width(suffix)
+		if midBudget < sepW+8 {
+			midBudget = sepW + 8
+		}
+		inner := midBudget - sepW
+		if inner < 6 {
+			inner = 6
+		}
+		nameBudget := min(28, inner/2)
+		nameShown := truncate(name, nameBudget)
+		cmdBudget := inner - lipgloss.Width(nameShown)
+		if cmdBudget < 6 {
+			cmdBudget = 6
+			nameShown = truncate(name, max(1, inner-cmdBudget))
 		}
 		cmdShown := truncate(cmd, cmdBudget)
-		raw := prefix + cmdShown + suffix
+		raw := prefix + nameShown + sep + cmdShown + suffix
 		raw = padRight(truncate(raw, w), w)
 		line := raw
 		if idx == m.selected {
