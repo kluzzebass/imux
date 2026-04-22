@@ -16,6 +16,10 @@ import (
 // and completion entrypoints go through Cobra.
 func Execute() error {
 	args := os.Args[1:]
+	if len(args) == 1 && args[0] == "--version" {
+		_, _ = fmt.Fprintln(os.Stdout, FormatVersion())
+		return nil
+	}
 	if routeToCobraReserved(args) {
 		cmd := NewRootCommand()
 		cmd.SetArgs(args)
@@ -40,6 +44,7 @@ func NewRootCommand() *cobra.Command {
 positional arguments are shell commands to run immediately in that session.
 
 Use "imux run" for non-TUI execution (merged output, exits when children finish).`,
+		Version:           FormatVersion(),
 		SilenceUsage:      true,
 		CompletionOptions: cobra.CompletionOptions{DisableDefaultCmd: true},
 		RunE: func(cmd *cobra.Command, args []string) error {

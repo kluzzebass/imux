@@ -13,3 +13,12 @@ Interactive Multiplexer for running and controlling many commands at once.
 See [`docs/architecture.md`](docs/architecture.md) for the supervisor model,
 process/state/event contracts, and restart/failure semantics that define the
 MVP foundation.
+
+## Releases and Homebrew
+
+- **CI:** pushes and pull requests against `main` run `.github/workflows/ci.yml` (`go build`, `go test`).
+- **Releases:** push a signed tag `v*` (e.g. `v0.1.0`). `.github/workflows/release.yml` runs tests, builds static binaries for Linux and macOS (amd64/arm64) plus Windows amd64, uploads them to a GitHub Release with `checksums.txt`, then updates the `imux` formula in [`kluzzebass/homebrew-tap`](https://github.com/kluzzebass/homebrew-tap) (same pattern as [gqlt](https://github.com/kluzzebass/gqlt/blob/main/.github/workflows/release.yml)).
+- **Repository secret:** add **`HOMEBREW_TAP_TOKEN`** (GitHub fine-grained PAT with push access to `homebrew-tap`) so the workflow can commit the formula.
+- **Install after publish:** `brew install kluzzebass/tap/imux` (tap path may vary with your fork).
+
+`imux --version` prints the embedded release version (set at link time on tagged builds).

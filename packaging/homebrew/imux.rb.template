@@ -1,0 +1,38 @@
+class Imux < Formula
+  desc "Interactive multiplexer for running and controlling many commands at once"
+  homepage "https://github.com/kluzzebass/imux"
+  version "VERSION_NUM"
+  license "MIT"
+
+  on_macos do
+    on_intel do
+      url "https://github.com/kluzzebass/imux/releases/download/VERSION/imux-darwin-amd64"
+      sha256 "SHA256_DARWIN_AMD64"
+    end
+
+    on_arm do
+      url "https://github.com/kluzzebass/imux/releases/download/VERSION/imux-darwin-arm64"
+      sha256 "SHA256_DARWIN_ARM64"
+    end
+  end
+
+  on_linux do
+    on_intel do
+      url "https://github.com/kluzzebass/imux/releases/download/VERSION/imux-linux-amd64"
+      sha256 "SHA256_LINUX_AMD64"
+    end
+
+    on_arm do
+      url "https://github.com/kluzzebass/imux/releases/download/VERSION/imux-linux-arm64"
+      sha256 "SHA256_LINUX_ARM64"
+    end
+  end
+
+  def install
+    bin.install Dir["imux-*"].first => "imux"
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/imux --version")
+  end
+end

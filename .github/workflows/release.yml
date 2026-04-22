@@ -1,0 +1,109 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Run tests
+        run: go test -v ./...
+
+      - name: Build binaries
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          COMMIT=$(git rev-parse --short HEAD)
+          DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          LDFLAGS="-s -w -X imux/internal/cli.BuildVersion=${VERSION} -X imux/internal/cli.BuildCommit=${COMMIT} -X imux/internal/cli.BuildDate=${DATE}"
+
+          mkdir -p dist
+
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/imux-linux-amd64 .
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags "$LDFLAGS" -o dist/imux-linux-arm64 .
+          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/imux-darwin-amd64 .
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags "$LDFLAGS" -o dist/imux-darwin-arm64 .
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/imux-windows-amd64.exe .
+
+          (cd dist && sha256sum imux-* > checksums.txt)
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/imux-linux-amd64
+            dist/imux-linux-arm64
+            dist/imux-darwin-amd64
+            dist/imux-darwin-arm64
+            dist/imux-windows-amd64.exe
+            dist/checksums.txt
+          generate_release_notes: true
+
+      - name: Extract version and checksums
+        id: version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          VERSION_NUM=${VERSION#v}
+          SHA256_DARWIN_X86=$(grep "imux-darwin-amd64" dist/checksums.txt | awk '{print $1}')
+          SHA256_DARWIN_ARM=$(grep "imux-darwin-arm64" dist/checksums.txt | awk '{print $1}')
+          SHA256_LINUX_X86=$(grep "imux-linux-amd64" dist/checksums.txt | awk '{print $1}')
+          SHA256_LINUX_ARM=$(grep "imux-linux-arm64" dist/checksums.txt | awk '{print $1}')
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "version_number=$VERSION_NUM" >> "$GITHUB_OUTPUT"
+          echo "sha256_darwin_x86=$SHA256_DARWIN_X86" >> "$GITHUB_OUTPUT"
+          echo "sha256_darwin_arm=$SHA256_DARWIN_ARM" >> "$GITHUB_OUTPUT"
+          echo "sha256_linux_x86=$SHA256_LINUX_X86" >> "$GITHUB_OUTPUT"
+          echo "sha256_linux_arm=$SHA256_LINUX_ARM" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout homebrew-tap
+        uses: actions/checkout@v4
+        with:
+          repository: kluzzebass/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Update Homebrew formula
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          VERSION_NUM: ${{ steps.version.outputs.version_number }}
+          SHA256_DARWIN_X86: ${{ steps.version.outputs.sha256_darwin_x86 }}
+          SHA256_DARWIN_ARM: ${{ steps.version.outputs.sha256_darwin_arm }}
+          SHA256_LINUX_X86: ${{ steps.version.outputs.sha256_linux_x86 }}
+          SHA256_LINUX_ARM: ${{ steps.version.outputs.sha256_linux_arm }}
+        run: |
+          cp packaging/homebrew/imux.rb.template homebrew-tap/imux.rb
+          sed -i.bak \
+            -e "s|VERSION_NUM|${VERSION_NUM}|g" \
+            -e "s|VERSION|${VERSION}|g" \
+            -e "s|SHA256_DARWIN_AMD64|${SHA256_DARWIN_X86}|g" \
+            -e "s|SHA256_DARWIN_ARM64|${SHA256_DARWIN_ARM}|g" \
+            -e "s|SHA256_LINUX_AMD64|${SHA256_LINUX_X86}|g" \
+            -e "s|SHA256_LINUX_ARM64|${SHA256_LINUX_ARM}|g" \
+            homebrew-tap/imux.rb
+          rm -f homebrew-tap/imux.rb.bak
+
+      - name: Commit and push Homebrew formula
+        run: |
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add imux.rb
+          git commit -m "Update imux to ${{ steps.version.outputs.version }}"
+          git push
