@@ -10,6 +10,7 @@ import (
 
 	"imux/internal/core"
 	"imux/internal/inspect"
+	"imux/internal/sessionlog"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -23,6 +24,7 @@ const (
 	overlayHelp
 	overlayAddProcess
 	overlayEditProcess
+	overlayLogFilter
 )
 
 type model struct {
@@ -37,11 +39,25 @@ type model struct {
 	dockScroll   int // first visible row index when len(ids) > dock capacity
 	tick         int
 
-	sup    *core.ExecSupervisor
-	store  core.StateStore
-	bus    core.EventBus
-	sub    <-chan core.Event
-	events []string
+	sup   *core.ExecSupervisor
+	store core.StateStore
+	bus   core.EventBus
+	sub   <-chan core.Event
+
+	slog           *sessionlog.SessionLog
+	opts           Options
+	showStdout     bool
+	showStderr     bool
+	showTime       bool
+	logScroll      int
+	filt           *compiledFilter
+	filterIsRegex  bool
+	filterPattern  string
+	filterEditBuf  string
+	filterEditIsRx bool
+	matchedIdx     []int64
+	lastBuiltN     int64
+	matchSig       string
 
 	inspectLines   []string
 	inspectCPU     *inspect.CPUSample
@@ -313,7 +329,22 @@ func (m *model) renderDock(dockRows int) string {
 	return strings.Join(lines, "\n")
 }
 
-func newModel() *model {
+func newModel(opts Options) (*model, error) {
+	slog, err := sessionlog.Open(opts.TeePath)
+	if err != nil {
+		return nil, err
+	}
+	isRe, pat, perr := ParseLogFilter(opts.LogFilter)
+	if perr != nil {
+		_ = slog.Close()
+		return nil, perr
+	}
+	cf, cerr := compileFilter(isRe, pat)
+	if cerr != nil {
+		_ = slog.Close()
+		return nil, cerr
+	}
+
 	bus := core.NewChanEventBus()
 	store := core.NewMapStateStore()
 	sup := core.NewExecSupervisor(bus, store)
@@ -358,17 +389,109 @@ func newModel() *model {
 		dock = append(dock, formatExecLine(shCmd, args))
 	}
 
-	return &model{
-		sup:       sup,
-		store:     store,
-		bus:       bus,
-		sub:       bus.Subscribe(512),
-		processes: names,
-		dockCmd:   dock,
-		ids:       ids,
-		selected:  0,
-		events:    []string{"[o] (imux) merged log — n new (name+shell, Tab) · e edit · dock ↑↓ 1–9 · Enter inspector · s/t/k/z/v/y."},
+	m := &model{
+		sup:            sup,
+		store:          store,
+		bus:            bus,
+		sub:            bus.Subscribe(512),
+		processes:      names,
+		dockCmd:        dock,
+		ids:            ids,
+		selected:       0,
+		slog:           slog,
+		opts:           opts,
+		showStdout:     true,
+		showStderr:     true,
+		filt:           cf,
+		filterIsRegex:  isRe,
+		filterPattern:  pat,
+		filterEditBuf:  pat,
+		filterEditIsRx: isRe,
+		lastBuiltN:     -1,
 	}
+	_ = m.appendMeta("imux TUI — one merged log for all processes · ? help · / filter · @ timestamps · O/E stdout/stderr · PgUp/PgDn · wheel · g tail · n/e dock")
+	return m, nil
+}
+
+func (m *model) dispose() {
+	if m.slog != nil {
+		_ = m.slog.Close()
+		m.slog = nil
+	}
+}
+
+func (m *model) logMatchSig() string {
+	return fmt.Sprintf("%s|%v|%v|%v", m.filterPattern, m.filterIsRegex, m.showStdout, m.showStderr)
+}
+
+func (m *model) forceLogRebuild() {
+	m.lastBuiltN = -1
+	m.matchedIdx = nil
+	m.matchSig = ""
+}
+
+func (m *model) syncLogIndices() error {
+	if m.slog == nil {
+		return nil
+	}
+	n, err := m.slog.LineCount()
+	if err != nil {
+		return err
+	}
+	sig := m.logMatchSig()
+	if m.lastBuiltN < 0 || n < m.lastBuiltN || sig != m.matchSig {
+		idx, err := MatchLineIndices(m.slog, m.filt, m.showStdout, m.showStderr)
+		if err != nil {
+			return err
+		}
+		m.matchedIdx = idx
+		m.lastBuiltN = n
+		m.matchSig = sig
+		return nil
+	}
+	if n > m.lastBuiltN {
+		var batch []int64
+		for i := n - 1; i >= m.lastBuiltN; i-- {
+			rec, err := m.slog.ReadLine(i)
+			if err != nil {
+				return err
+			}
+			if !passesStreamToggles(rec, m.showStdout, m.showStderr) {
+				continue
+			}
+			if !m.filt.match(flatRecord(rec)) {
+				continue
+			}
+			batch = append(batch, i)
+		}
+		m.matchedIdx = append(batch, m.matchedIdx...)
+		m.lastBuiltN = n
+	}
+	return nil
+}
+
+func (m *model) appendMeta(msg string) error {
+	if m.slog == nil {
+		return nil
+	}
+	return m.slog.Append(sessionlog.Record{
+		K:   sessionlog.KindMeta,
+		Msg: msg,
+		T:   time.Now(),
+	})
+}
+
+func (m *model) applyLogFilter() {
+	m.overlay = overlayNone
+	m.filterIsRegex = m.filterEditIsRx
+	m.filterPattern = strings.TrimSpace(m.filterEditBuf)
+	cf, err := compileFilter(m.filterIsRegex, m.filterPattern)
+	if err != nil {
+		m.appendLogLine("filter: " + err.Error())
+		return
+	}
+	m.filt = cf
+	m.forceLogRebuild()
 }
 
 func (m *model) currentID() core.ProcessID {
@@ -386,10 +509,7 @@ func (m *model) currentName() string {
 }
 
 func (m *model) appendLogLine(line string) {
-	m.events = append(m.events, line)
-	if len(m.events) > 500 {
-		m.events = m.events[len(m.events)-500:]
-	}
+	_ = m.appendMeta(line)
 }
 
 func (m *model) appendCtlErr(op string, err error) {
@@ -443,19 +563,36 @@ func (m *model) drainEvents() {
 	for {
 		select {
 		case e := <-m.sub:
-			if e.Type == core.EventProcessOutput {
-				tag := e.Stream
-				if tag == "" {
-					tag = "?"
-				}
-				who := string(e.ProcessID)
-				if e.ProcessName != "" {
-					who = e.ProcessName
-				}
-				m.appendLogLine(fmt.Sprintf("[%s|%s] %s", tag, who, e.Message))
+			if m.slog == nil {
 				continue
 			}
-			m.appendLogLine(fmt.Sprintf("[%s] %s %s", e.Type, e.ProcessID, e.Message))
+			if e.Type == core.EventProcessOutput {
+				k := sessionlog.KindStdout
+				switch e.Stream {
+				case "e":
+					k = sessionlog.KindStderr
+				case "o", "":
+					k = sessionlog.KindStdout
+				default:
+					k = sessionlog.KindMeta
+					e.Message = fmt.Sprintf("stream=%q %s", e.Stream, e.Message)
+				}
+				_ = m.slog.Append(sessionlog.Record{
+					T:    e.Timestamp,
+					K:    k,
+					ID:   string(e.ProcessID),
+					Name: e.ProcessName,
+					Msg:  e.Message,
+				})
+				continue
+			}
+			_ = m.slog.Append(sessionlog.Record{
+				T:    e.Timestamp,
+				K:    sessionlog.KindMeta,
+				ID:   string(e.ProcessID),
+				Name: e.ProcessName,
+				Msg:  fmt.Sprintf("[%s] %s", e.Type, e.Message),
+			})
 		default:
 			return
 		}
@@ -670,7 +807,67 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.clampDockScroll(m.dockVisibleCount())
+	case tea.MouseMsg:
+		logH, _ := m.layoutHeights()
+		if msg.Y >= logH {
+			break
+		}
+		if msg.Action != tea.MouseActionPress {
+			break
+		}
+		switch msg.Button {
+		case tea.MouseButtonWheelDown:
+			m.logScroll += 3
+		case tea.MouseButtonWheelUp:
+			if m.logScroll >= 3 {
+				m.logScroll -= 3
+			} else {
+				m.logScroll = 0
+			}
+		}
 	case tea.KeyMsg:
+		if m.overlay == overlayLogFilter {
+			if msg.String() == "?" {
+				m.helpReturnTo = overlayLogFilter
+				m.overlay = overlayHelp
+				return m, nil
+			}
+			switch msg.String() {
+			case "ctrl+c":
+				m.shutdownProcs()
+				return m, tea.Quit
+			case "esc":
+				m.overlay = overlayNone
+			case "enter":
+				m.applyLogFilter()
+			case "tab":
+				m.filterEditIsRx = !m.filterEditIsRx
+			case "backspace":
+				m.filterEditBuf = trimLastRune(m.filterEditBuf)
+			default:
+				if msg.Type == tea.KeyRunes {
+					m.filterEditBuf += string(msg.Runes)
+					if len(m.filterEditBuf) > 512 {
+						m.filterEditBuf = m.filterEditBuf[:512]
+					}
+				}
+			}
+			return m, nil
+		}
+		if m.overlay != overlayAddProcess && m.overlay != overlayEditProcess {
+			switch msg.Type {
+			case tea.KeyPgUp:
+				m.logScroll += 5
+				return m, nil
+			case tea.KeyPgDown:
+				if m.logScroll >= 5 {
+					m.logScroll -= 5
+				} else {
+					m.logScroll = 0
+				}
+				return m, nil
+			}
+		}
 		if m.overlay == overlayAddProcess || m.overlay == overlayEditProcess {
 			edit := m.overlay == overlayEditProcess
 			if msg.String() == "?" {
@@ -784,6 +981,38 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else if m.overlay != overlayNone {
 				m.overlay = overlayNone
 			}
+		case "g":
+			if m.overlay == overlayHelp {
+				break
+			}
+			m.logScroll = 0
+		case "O":
+			if m.overlay == overlayHelp {
+				break
+			}
+			m.showStdout = !m.showStdout
+			m.forceLogRebuild()
+		case "E":
+			if m.overlay == overlayHelp {
+				break
+			}
+			m.showStderr = !m.showStderr
+			m.forceLogRebuild()
+		case "@":
+			if m.overlay == overlayHelp {
+				break
+			}
+			m.showTime = !m.showTime
+		case "/":
+			if m.overlay == overlayHelp {
+				break
+			}
+			if m.overlay == overlayAddProcess || m.overlay == overlayEditProcess {
+				break
+			}
+			m.overlay = overlayLogFilter
+			m.filterEditBuf = m.filterPattern
+			m.filterEditIsRx = m.filterIsRegex
 		case "n":
 			if m.overlay == overlayHelp {
 				break
@@ -976,8 +1205,20 @@ func (m *model) renderFooter() string {
 		s = "Esc cancels · Enter adds"
 	case overlayEditProcess:
 		s = "Esc cancels · Enter saves · s starts"
+	case overlayLogFilter:
+		s = "Esc cancel · Enter apply · Tab glob/regex"
 	default:
-		s = "? help · q quit"
+		ss, se, tt := "on", "on", "off"
+		if !m.showStdout {
+			ss = "off"
+		}
+		if !m.showStderr {
+			se = "off"
+		}
+		if m.showTime {
+			tt = "on"
+		}
+		s = fmt.Sprintf("? help · q quit · O/E/@ out=%s err=%s time=%s · / filter · g tail · PgUp/PgDn", ss, se, tt)
 	}
 	return padRight(truncate(s, m.width), m.width)
 }
@@ -1001,45 +1242,14 @@ func (m *model) renderBody(bodyH int) string {
 }
 
 func (m *model) composeLines(n int) []string {
-	ev := m.events
-	if len(ev) >= n {
-		return append([]string(nil), ev[len(ev)-n:]...)
+	if err := m.syncLogIndices(); err != nil {
+		return []string{lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Render("log: ") + err.Error()}
 	}
-	ph := m.placeholderStreamLines(n - len(ev))
-	out := append([]string(nil), ph...)
-	out = append(out, ev...)
-	for len(out) < n {
-		out = append(out, "")
+	lines, err := BuildWindowLinesFromIndices(m.slog, m.matchedIdx, m.logScroll, n, m.showTime)
+	if err != nil {
+		return []string{"log: " + err.Error()}
 	}
-	if len(out) > n {
-		out = out[len(out)-n:]
-	}
-	return out
-}
-
-func (m *model) placeholderStreamLines(n int) []string {
-	proc := m.currentName()
-	if proc == "" {
-		proc = "(none)"
-	}
-	t := m.tick
-	out := make([]string, 0, n)
-	out = append(out, fmt.Sprintf("[o] (%s) stdout placeholder (t=%d)", proc, t))
-	out = append(out, fmt.Sprintf("[e] (%s) stderr placeholder (t=%d)", proc, t))
-	for i := 2; i < n; i++ {
-		if i%3 == 0 {
-			out = append(out, fmt.Sprintf("[o] (%s) line=%d …", proc, i))
-		} else {
-			out = append(out, fmt.Sprintf("[e] (%s) line=%d …", proc, i))
-		}
-	}
-	if len(out) > n {
-		out = out[:n]
-	}
-	for len(out) < n {
-		out = append(out, "")
-	}
-	return out
+	return lines
 }
 
 func (m *model) renderModal() string {
@@ -1056,6 +1266,10 @@ func (m *model) renderModal() string {
 	if m.overlay == overlayAddProcess || m.overlay == overlayEditProcess {
 		maxW = min(72, m.width-4)
 		maxH = min(16, m.height-4)
+	}
+	if m.overlay == overlayLogFilter {
+		maxW = min(72, m.width-4)
+		maxH = min(10, m.height-4)
 	}
 	if maxW < 24 {
 		maxW = 24
@@ -1080,8 +1294,8 @@ func (m *model) renderModal() string {
 		title = "Help"
 		proc := m.currentName()
 		bodyLines = []string{
-			"One merged log view; lifecycle lines come from the supervisor",
-			"event bus (errors are prefixed with [error]).",
+			"One merged log for all processes (dock selection does not swap the log).",
+			"Log lines are stored on disk (unlinked temp); use imux tui --tee for a persisted copy.",
 			"",
 			"Keys:",
 			"  ↑ ↓           move selection in the bottom dock",
@@ -1091,6 +1305,9 @@ func (m *model) renderModal() string {
 			"  Enter or i    inspector (Esc or Enter closes, r refreshes)",
 			"  n             new process (name + command, Tab switches field)",
 			"  e             edit name + command (stop first; Enter saves, then s to run)",
+			"  O E @         toggle stdout / stderr / timestamps in the log view",
+			"  PgUp PgDn     scroll log · mouse wheel over log · g jump to tail",
+			"  /             edit log filter (glob or regex; Tab toggles mode)",
 			"  ? Esc         help · close overlay",
 			"  q Ctrl+c      quit (stops running demos)",
 			"",
@@ -1107,6 +1324,21 @@ func (m *model) renderModal() string {
 		title = "Edit process"
 		bodyLines = append([]string{fmt.Sprintf("id %s — same slot.", m.editTargetID)},
 			lineFormModalBody(innerW, m.lineOverlayField, m.tick, m.editNameBuf, m.editBuf, "Esc cancel · Enter save (pending — s to start)")...)
+	case overlayLogFilter:
+		title = "Log filter"
+		mode := "glob"
+		if m.filterEditIsRx {
+			mode = "regex"
+		}
+		bodyLines = []string{
+			"Pattern (empty = no filter). Tab toggles glob vs regex.",
+			"Prefix optional on CLI: glob:… or re:…",
+			"",
+			padRight(truncate("Mode: "+mode, innerW), innerW),
+			padRight(truncate("> "+m.filterEditBuf, innerW), innerW),
+			"",
+			"Esc cancel · Enter apply · Tab mode",
+		}
 	default:
 		title = ""
 		bodyLines = nil
@@ -1165,8 +1397,13 @@ func padRight(s string, width int) string {
 }
 
 // Run launches the alt-screen Bubble Tea application.
-func Run() error {
-	p := tea.NewProgram(newModel(), tea.WithAltScreen())
-	_, err := p.Run()
+func Run(opts Options) error {
+	m, err := newModel(opts)
+	if err != nil {
+		return err
+	}
+	defer m.dispose()
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
+	_, err = p.Run()
 	return err
 }
