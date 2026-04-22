@@ -105,8 +105,18 @@ fi
 echo "Closing $ISSUE_ID..."
 dcat close "$ISSUE_ID" --reason "$REASON"
 
-echo "Committing tracked changes..."
-git add -A
+if [[ "$ALREADY_MERGED" == "yes" ]]; then
+  if [[ -n "$(git status --porcelain -- ':!.dogcats')" ]]; then
+    echo "Recovery mode refuses to commit: there are changes outside .dogcats." >&2
+    echo "Commit or stash them first, then re-run with the same flags." >&2
+    exit 1
+  fi
+  echo "Committing dcat state under .dogcats/..."
+  git add .dogcats
+else
+  echo "Committing issue branch work..."
+  git add -A
+fi
 git commit -m "$COMMIT_MESSAGE"
 
 if [[ "$ALREADY_MERGED" == "yes" ]]; then

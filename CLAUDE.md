@@ -43,7 +43,7 @@ If the work was merged into `main` without going through `just close-issue` (Git
 
 `just close-issue-on-main <issueId> "<reason>" "<commit-message>" yes`
 
-That runs the helper in recovery mode: `dcat close`, commit tracker files, push — no `git merge`.
+That runs the helper in recovery mode: `dcat close`, commit only `.dogcats/` (refuses if other paths are dirty), push — no `git merge`.
 
 #### Non-negotiable rules
 
