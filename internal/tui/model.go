@@ -87,6 +87,21 @@ func shellWrapUserCommand(script string) (cmd string, args []string) {
 	return "sh", []string{"-c", script}
 }
 
+// innerCommandForEdit returns the user-editable script, stripping one imux-style
+// sh -c / cmd /C wrapper so saving does not nest shells.
+func innerCommandForEdit(sp core.ProcessSpec) string {
+	if runtime.GOOS == "windows" {
+		if strings.EqualFold(sp.Command, "cmd.exe") && len(sp.Args) >= 2 && strings.EqualFold(sp.Args[0], "/c") {
+			return strings.Join(sp.Args[1:], " ")
+		}
+	} else {
+		if sp.Command == "sh" && len(sp.Args) >= 2 && sp.Args[0] == "-c" {
+			return strings.Join(sp.Args[1:], " ")
+		}
+	}
+	return formatExecLine(sp.Command, sp.Args)
+}
+
 func trimLastRune(s string) string {
 	if s == "" {
 		return ""
@@ -763,16 +778,26 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.appendLogLine("[error] edit: stop the process first")
 				break
 			}
+			ctx := context.Background()
+			specs, err := m.sup.List(ctx)
+			if err != nil {
+				m.appendLogLine(fmt.Sprintf("[error] edit: %v", err))
+				break
+			}
+			var spec *core.ProcessSpec
+			for i := range specs {
+				if specs[i].ID == id {
+					spec = &specs[i]
+					break
+				}
+			}
+			if spec == nil {
+				m.appendLogLine("[error] edit: process not found")
+				break
+			}
 			m.editTargetID = id
-			if m.selected >= 0 && m.selected < len(m.dockCmd) {
-				m.editBuf = m.dockCmd[m.selected]
-			} else {
-				m.editBuf = string(id)
-			}
-			m.editNameBuf = ""
-			if m.selected >= 0 && m.selected < len(m.processes) {
-				m.editNameBuf = m.processes[m.selected]
-			}
+			m.editBuf = innerCommandForEdit(*spec)
+			m.editNameBuf = spec.Name
 			m.lineOverlayField = lineFormNameField
 			m.overlay = overlayEditProcess
 		case "enter":

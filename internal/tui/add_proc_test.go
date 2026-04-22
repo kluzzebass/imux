@@ -1,6 +1,11 @@
 package tui
 
-import "testing"
+import (
+	"runtime"
+	"testing"
+
+	"imux/internal/core"
+)
 
 func TestTrimLastRune(t *testing.T) {
 	t.Parallel()
@@ -34,6 +39,36 @@ func TestNameFromCommandLine(t *testing.T) {
 func TestSanitizeDisplayName(t *testing.T) {
 	t.Parallel()
 	if got := sanitizeDisplayName("  foo\nbar  "); got != "foo bar" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestInnerCommandForEditShWrap(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX sh -c")
+	}
+	sp := core.ProcessSpec{Command: "sh", Args: []string{"-c", "sleep 1"}}
+	if got := innerCommandForEdit(sp); got != "sleep 1" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestInnerCommandForEditNonWrap(t *testing.T) {
+	t.Parallel()
+	sp := core.ProcessSpec{Command: "sleep", Args: []string{"1"}}
+	if got := innerCommandForEdit(sp); got != "sleep 1" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestInnerCommandForEditCmdWrap(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS != "windows" {
+		t.Skip("cmd.exe /C")
+	}
+	sp := core.ProcessSpec{Command: "cmd.exe", Args: []string{"/C", "echo hi"}}
+	if got := innerCommandForEdit(sp); got != "echo hi" {
 		t.Fatalf("got %q", got)
 	}
 }
