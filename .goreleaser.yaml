@@ -1,0 +1,64 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+version: 2
+
+before:
+  hooks:
+    - go test ./...
+
+builds:
+  - id: imux
+    main: .
+    binary: imux
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
+    ldflags:
+      - -s -w
+      - -X imux/internal/cli.BuildVersion={{.Version}}
+      - -X imux/internal/cli.BuildCommit={{.ShortCommit}}
+      - -X imux/internal/cli.BuildDate={{.Date}}
+
+archives:
+  - id: imux
+    ids:
+      - imux
+    formats:
+      - binary
+    name_template: "{{ .Binary }}-{{ .Os }}-{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+changelog:
+  use: github-native
+
+release:
+  draft: true
+
+brews:
+  - name: imux
+    homepage: https://github.com/kluzzebass/imux
+    description: Interactive multiplexer for running and controlling many commands at once
+    license: MIT
+    # Tap URLs must not go live until the GitHub release is published (draft assets are not public).
+    skip_upload: '{{ if or (not (isEnvSet "HOMEBREW_TAP_TOKEN")) (and (isEnvSet "SKIP_HOMEBREW_TAP") (eq .Env.SKIP_HOMEBREW_TAP "true")) }}true{{ else }}false{{ end }}'
+    repository:
+      owner: kluzzebass
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    commit_author:
+      name: github-actions[bot]
+      email: github-actions[bot]@users.noreply.github.com
+    commit_msg_template: "Brew formula update for {{ .ProjectName }} version {{ .Tag }}"
+    test: |
+      assert_match version.to_s, shell_output("#{bin}/imux --version")
