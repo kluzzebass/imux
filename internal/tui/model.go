@@ -244,7 +244,14 @@ func (m *model) renderDock(dockRows int) string {
 	if w < 1 {
 		w = 1
 	}
-	selStyle := lipgloss.NewStyle().Background(lipgloss.Color("235")).Foreground(lipgloss.Color("252")).Width(w)
+	dockBase := lipgloss.NewStyle().
+		Background(lipgloss.Color("236")).
+		Foreground(lipgloss.Color("247")).
+		Width(w)
+	dockSel := lipgloss.NewStyle().
+		Background(lipgloss.Color("238")).
+		Foreground(lipgloss.Color("252")).
+		Width(w)
 	lines := make([]string, 0, dockRows)
 	for r := 0; r < dockRows; r++ {
 		idx := m.dockScroll + r
@@ -297,9 +304,9 @@ func (m *model) renderDock(dockRows int) string {
 		cmdShown := truncate(cmd, cmdBudget)
 		raw := prefix + nameShown + sep + cmdShown + suffix
 		raw = padRight(truncate(raw, w), w)
-		line := raw
+		line := dockBase.Render(raw)
 		if idx == m.selected {
-			line = selStyle.Render(raw)
+			line = dockSel.Render(raw)
 		}
 		lines = append(lines, line)
 	}
