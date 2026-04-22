@@ -7,7 +7,6 @@ import (
 	"os/signal"
 	"runtime"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
@@ -30,13 +29,17 @@ func NewRunCommand() *cobra.Command {
 	nameCSV := ""
 
 	cmd := &cobra.Command{
-		Use:     "run \"cmd1\" \"cmd2\" ...",
+		Use:   "run \"cmd1\" \"cmd2\" ...",
+		Short: "Run commands in plain terminal mode (no TUI; for scripts and CI)",
+		Long: `Starts each command as a managed process, streams merged tagged lines to stdout,
+then exits when every process has finished (exited or failed). Short commands like ls or ps
+therefore end almost immediately—that is expected. For an interactive session use imux
+without "run" (the TUI), or keep at least one long-lived child under imux run.`,
 		Aliases: []string{"r"},
-		Short:   "Run one or more commands without launching the TUI",
 		Args:    cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if nameCSV != "" {
-				opts.Names = splitCSV(nameCSV)
+				opts.Names = SplitCSV(nameCSV)
 			}
 			return runNonTUI(cmd, opts, args)
 		},
@@ -46,6 +49,9 @@ func NewRunCommand() *cobra.Command {
 	cmd.Flags().DurationVar(&opts.Grace, "grace", 60*time.Second, "grace period before forced kill after SIGTERM")
 	cmd.Flags().BoolVar(&opts.NoFailFast, "no-fail-fast", false, "keep running when a process exits")
 	cmd.Flags().StringVar(&opts.TeePath, "tee", "", "file path to tee merged output to (without ANSI colors)")
+	// After the first shell command token, treat everything as positional (e.g. `ls -lR`
+	// must not parse `-lR` as flags).
+	cmd.Flags().SetInterspersed(false)
 
 	return cmd
 }
@@ -59,6 +65,9 @@ func runNonTUI(cmd *cobra.Command, opts RunOptions, commands []string) error {
 	}
 	if len(names) != len(commands) {
 		return fmt.Errorf("%d names but %d commands", len(names), len(commands))
+	}
+	if err := DuplicateSlotIDs(names); err != nil {
+		return fmt.Errorf("--name: %w", err)
 	}
 
 	bus := core.NewChanEventBus()
@@ -221,16 +230,4 @@ func shellInvocation() (cmd string, arg string) {
 		return "cmd.exe", "/C"
 	}
 	return "sh", "-c"
-}
-
-func splitCSV(input string) []string {
-	parts := strings.Split(input, ",")
-	out := make([]string, 0, len(parts))
-	for _, part := range parts {
-		trimmed := strings.TrimSpace(part)
-		if trimmed != "" {
-			out = append(out, trimmed)
-		}
-	}
-	return out
 }

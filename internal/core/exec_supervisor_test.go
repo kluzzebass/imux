@@ -246,3 +246,116 @@ func TestExecSupervisorUnregisterRejectsRunning(t *testing.T) {
 	}
 	_ = sup.Stop(ctx, id)
 }
+
+func TestExecSupervisorReplaceSpecPending(t *testing.T) {
+	t.Parallel()
+	sup := NewExecSupervisor(NewChanEventBus(), NewMapStateStore())
+	ctx := context.Background()
+	id := ProcessID("edit1")
+	if err := sup.Register(ctx, ProcessSpec{
+		ID:      id,
+		Name:    "a",
+		Command: "sh",
+		Args:    []string{"-c", "true"},
+		Restart: RestartConfig{Policy: RestartOnFailure, MaxRestarts: 3},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	newSpec := ProcessSpec{
+		ID:      id,
+		Name:    "b",
+		Command: "sh",
+		Args:    []string{"-c", "echo hi"},
+		Restart: RestartConfig{Policy: RestartOnFailure, MaxRestarts: 3},
+	}
+	if err := sup.ReplaceSpec(ctx, id, newSpec); err != nil {
+		t.Fatal(err)
+	}
+	list, err := sup.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || list[0].Name != "b" || len(list[0].Args) != 2 || list[0].Args[0] != "-c" || list[0].Args[1] != "echo hi" {
+		t.Fatalf("list = %#v", list)
+	}
+}
+
+func TestExecSupervisorReplaceSpecRejectsRunning(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("uses sleep")
+	}
+	sup := NewExecSupervisor(NewChanEventBus(), NewMapStateStore())
+	ctx := context.Background()
+	id := ProcessID("edit2")
+	if err := sup.Register(ctx, ProcessSpec{
+		ID:      id,
+		Name:    "s",
+		Command: "sleep",
+		Args:    []string{"30"},
+		Restart: RestartConfig{Policy: RestartNever},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sup.Start(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(40 * time.Millisecond)
+	err := sup.ReplaceSpec(ctx, id, ProcessSpec{
+		ID:      id,
+		Name:    "x",
+		Command: "sh",
+		Args:    []string{"-c", "true"},
+		Restart: RestartConfig{Policy: RestartNever},
+	})
+	if err == nil {
+		t.Fatal("expected replace spec error while running")
+	}
+	_ = sup.Stop(ctx, id)
+}
+
+func TestExecSupervisorReplaceSpecAfterStopSucceeds(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("uses sleep")
+	}
+	sup := NewExecSupervisor(NewChanEventBus(), NewMapStateStore())
+	ctx := context.Background()
+	id := ProcessID("edit3")
+	if err := sup.Register(ctx, ProcessSpec{
+		ID:      id,
+		Name:    "s",
+		Command: "sleep",
+		Args:    []string{"30"},
+		Restart: RestartConfig{Policy: RestartNever},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sup.Start(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(40 * time.Millisecond)
+	newSpec := ProcessSpec{
+		ID:      id,
+		Name:    "x",
+		Command: "sh",
+		Args:    []string{"-c", "true"},
+		Restart: RestartConfig{Policy: RestartNever},
+	}
+	if err := sup.ReplaceSpec(ctx, id, newSpec); err == nil {
+		t.Fatal("expected replace spec error while running")
+	}
+	if err := sup.Stop(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	if err := sup.ReplaceSpec(ctx, id, newSpec); err != nil {
+		t.Fatalf("replace after stop: %v", err)
+	}
+	list, err := sup.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || list[0].Name != "x" {
+		t.Fatalf("list = %#v", list)
+	}
+}

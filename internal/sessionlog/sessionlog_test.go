@@ -48,7 +48,7 @@ func TestSessionLogNoTee(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = s.Close() }()
-	if err := s.Append(Record{K: KindMeta, Msg: "x", T: time.Unix(1, 0)}); err != nil {
+	if err := s.Append(Record{K: KindStdout, ID: "x", Msg: "x", T: time.Unix(1, 0)}); err != nil {
 		t.Fatal(err)
 	}
 	n, _ := s.LineCount()

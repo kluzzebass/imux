@@ -3,8 +3,10 @@ package tui
 import (
 	"context"
 	"fmt"
+	"os"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -12,8 +14,11 @@ import (
 	"imux/internal/inspect"
 	"imux/internal/sessionlog"
 
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
+	xterm "github.com/charmbracelet/x/term"
 )
 
 type overlayKind int
@@ -25,19 +30,53 @@ const (
 	overlayAddProcess
 	overlayEditProcess
 	overlayLogFilter
+	overlayKillSignal
 )
+
+// dockSlot is one logical process row. Tombstones (Deleted) stay in stable session order
+// so merged-log colors stay aligned; they are omitted from the visible dock.
+type dockSlot struct {
+	ID      core.ProcessID
+	Name    string
+	DockCmd string
+	Deleted bool
+}
 
 type model struct {
 	width        int
 	height       int
 	overlay      overlayKind
 	helpReturnTo overlayKind
-	processes    []string // display names from ProcessSpec
-	dockCmd      []string // one-line shell command for dock (Command + Args)
-	ids          []core.ProcessID
+	processes    []string         // visible dock only (derived from slots)
+	dockCmd      []string         // visible dock only
+	ids          []core.ProcessID // visible dock only
+	slots        []dockSlot       // stable order incl. tombstones; drives log color keys
 	selected     int
 	dockScroll   int // first visible row index when len(ids) > dock capacity
 	tick         int
+
+	pendingQuit         bool
+	pendingQuitDeadline time.Time // second q/Ctrl+c quits before this; zero when not armed
+
+	pendingDelete         bool
+	pendingDeleteDeadline time.Time // second d removes slot before this; zero when not armed
+	pendingDeleteID       core.ProcessID
+
+	pendingStop         bool
+	pendingStopDeadline time.Time
+	pendingStopID       core.ProcessID
+
+	pendingStopAll         bool
+	pendingStopAllDeadline time.Time
+
+	killSignalTargetID core.ProcessID
+	killSignalSel      int
+	killSignalBulkAll  bool // true when overlay opened with K (all running slots)
+
+	// Ephemeral UI messages (appendToast); shown in the footer, not in the merged log.
+	toastText     string
+	toastDeadline time.Time
+	toastKind     ToastKind
 
 	sup   *core.ExecSupervisor
 	store core.StateStore
@@ -48,14 +87,13 @@ type model struct {
 	opts           Options
 	showStdout     bool
 	showStderr     bool
-	showTime       bool
+	logTimePrec    logTimePrecision
 	logScroll      int
-	filt           *compiledFilter
-	filterIsRegex  bool
-	filterPattern  string
-	filterEditBuf  string
-	filterEditIsRx bool
-	matchedIdx     []int64
+	logHScroll     int // horizontal pan of log lines (terminal cells)
+	filt          *compiledFilter
+	filterPattern string
+	filterInp     textinput.Model
+	matchedIdx    []int64
 	lastBuiltN     int64
 	matchSig       string
 
@@ -63,18 +101,35 @@ type model struct {
 	inspectCPU     *inspect.CPUSample
 	inspectFocusID core.ProcessID
 
-	addBuf           string
-	addNameBuf       string
-	nextUserSeq      int
-	editBuf          string
-	editNameBuf      string
-	editTargetID     core.ProcessID
+	nextUserSeq int
+	addNameInp  textinput.Model
+	addCmdInp   textinput.Model
+	editNameInp textinput.Model
+	editCmdInp  textinput.Model
+	editTargetID core.ProcessID
 	lineOverlayField int // lineFormNameField or lineFormCmdField
+	modalErr         string // add/edit overlay: last save/register failure (footer toasts are hidden there)
+
+	// lastExitCode is set from supervisor bus messages for dock display after exit/fail.
+	lastExitCode map[core.ProcessID]int
 }
 
 type tickMsg time.Time
 
-const tickInterval = 400 * time.Millisecond
+// busEventMsg carries one supervisor event into the Bubble Tea loop as soon as it is
+// published, so output is not delayed until the next UI tick (~400ms).
+type busEventMsg core.Event
+
+const (
+	tickInterval = 400 * time.Millisecond
+
+	// pendingConfirmWindow is how long the user has to press the confirming key again
+	// (quit, delete slot, stop, stop-all).
+	pendingConfirmWindow = 3 * time.Second
+
+	// defaultToastLifetime is how long footer status toasts stay visible.
+	defaultToastLifetime = 3 * time.Second
+)
 
 func tickCmd() tea.Cmd {
 	return tea.Tick(tickInterval, func(t time.Time) tea.Msg {
@@ -82,11 +137,14 @@ func tickCmd() tea.Cmd {
 	})
 }
 
-func demoLongCommand() (cmd string, args []string) {
-	if runtime.GOOS == "windows" {
-		return "timeout", []string{"/t", "86400", "/nobreak"}
+func (m *model) listenCmd() tea.Cmd {
+	if m.sub == nil {
+		return nil
 	}
-	return "sleep", []string{"86400"}
+	sub := m.sub
+	return func() tea.Msg {
+		return busEventMsg(<-sub)
+	}
 }
 
 func formatExecLine(cmd string, args []string) string {
@@ -118,14 +176,6 @@ func innerCommandForEdit(sp core.ProcessSpec) string {
 	return formatExecLine(sp.Command, sp.Args)
 }
 
-func trimLastRune(s string) string {
-	if s == "" {
-		return ""
-	}
-	r := []rune(s)
-	return string(r[:len(r)-1])
-}
-
 func nameFromCommandLine(line string) string {
 	fields := strings.Fields(line)
 	if len(fields) == 0 {
@@ -151,48 +201,94 @@ func sanitizeDisplayName(s string) string {
 	return truncate(s, 48)
 }
 
-// prefixedInputLine draws prefix + truncated buffer + optional blinking caret for the active field.
-func prefixedInputLine(prefix, buf string, innerW int, active bool, tick int) string {
-	pw := lipgloss.Width(prefix)
-	maxBuf := innerW - pw
-	if maxBuf < 1 {
-		return truncate(prefix, innerW)
+// effectiveDockLabel is how a slot reads in the dock (same idea as nameForID on slots).
+func effectiveDockLabel(name string, id core.ProcessID) string {
+	n := strings.TrimSpace(name)
+	if n != "" {
+		return n
 	}
-	if !active {
-		return prefix + truncate(buf, maxBuf)
-	}
-	caret := "▏"
-	if tick%2 == 1 {
-		caret = " "
-	}
-	cw := lipgloss.Width(caret)
-	textW := maxBuf - cw
-	if textW < 1 {
-		textW = 1
-	}
-	return prefix + truncate(buf, textW) + caret
+	return string(id)
 }
 
-func lineFormModalBody(innerW, field, tick int, nameBuf, cmdBuf, footer string) []string {
-	nameMark := "  "
-	cmdMark := "  "
-	if field == lineFormNameField {
-		nameMark = "> "
+// displayNameConflicts reports whether candidate matches another slot's effective dock label
+// (case-insensitive). ignoreID skips that slot (use "" when registering a new process).
+func displayNameConflicts(specs []core.ProcessSpec, ignoreID core.ProcessID, candidate string) (otherID core.ProcessID, yes bool) {
+	candidate = strings.TrimSpace(candidate)
+	if candidate == "" {
+		return "", false
+	}
+	for _, sp := range specs {
+		if ignoreID != "" && sp.ID == ignoreID {
+			continue
+		}
+		if strings.EqualFold(effectiveDockLabel(sp.Name, sp.ID), candidate) {
+			return sp.ID, true
+		}
+	}
+	return "", false
+}
+
+// resolvedNameFromBuffers is the display name tryAdd/tryEdit would use for these buffers.
+func resolvedNameFromBuffers(nameBuf, cmdBuf string) string {
+	name := sanitizeDisplayName(nameBuf)
+	line := strings.TrimSpace(cmdBuf)
+	if name == "" {
+		name = nameFromCommandLine(line)
+	}
+	if name == "" {
+		name = "proc"
+	}
+	return name
+}
+
+// nameEntryConflicts is true when the current add/edit draft name would collide with another slot's dock label.
+func (m *model) nameEntryConflicts(edit bool) bool {
+	if m.sup == nil {
+		return false
+	}
+	var nameBuf, cmdBuf string
+	var self core.ProcessID
+	if edit {
+		if m.editTargetID == "" {
+			return false
+		}
+		nameBuf, cmdBuf, self = m.editNameInp.Value(), m.editCmdInp.Value(), m.editTargetID
 	} else {
-		cmdMark = "> "
+		nameBuf, cmdBuf = m.addNameInp.Value(), m.addCmdInp.Value()
 	}
-	nPrefix := nameMark + "Name: "
-	cPrefix := cmdMark + "$ "
-	nameLine := prefixedInputLine(nPrefix, nameBuf, innerW, field == lineFormNameField, tick)
-	cmdLine := prefixedInputLine(cPrefix, cmdBuf, innerW, field == lineFormCmdField, tick)
-	return []string{
-		"Tab switches name / command.",
-		"",
-		nameLine,
-		cmdLine,
-		"",
-		footer,
+	name := resolvedNameFromBuffers(nameBuf, cmdBuf)
+	ctx := context.Background()
+	specs, err := m.sup.List(ctx)
+	if err != nil {
+		return false
 	}
+	_, dup := displayNameConflicts(specs, self, name)
+	return dup
+}
+
+// modalSaveErrMessage turns supervisor/API errors into short copy for the add/edit dialog.
+func modalSaveErrMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+	s := err.Error()
+	switch {
+	case strings.Contains(s, "still has an active child"):
+		return "Save still blocked after stopping the process — try Enter again, or Esc to discard."
+	case strings.HasPrefix(s, "replace spec: "):
+		return strings.TrimSpace(strings.TrimPrefix(s, "replace spec: "))
+	default:
+		return s
+	}
+}
+
+func appendModalSaveErr(body []string, innerW int, msg string) []string {
+	msg = strings.TrimSpace(msg)
+	if msg == "" {
+		return body
+	}
+	// Full message; wrapModalLines will soft-wrap to innerW (truncate() was cell-wrong and hid the tail).
+	return append(body, "", msg)
 }
 
 func (m *model) dockVisibleCount() int {
@@ -277,7 +373,7 @@ func (m *model) renderDock(dockRows int) string {
 		id := m.ids[idx]
 		st := "(?)"
 		if s, ok := m.store.Get(id); ok {
-			st = string(s)
+			st = dockStatusWithExit(m, id, s)
 		}
 		hot := "· "
 		if idx < 9 {
@@ -334,12 +430,12 @@ func newModel(opts Options) (*model, error) {
 	if err != nil {
 		return nil, err
 	}
-	isRe, pat, perr := ParseLogFilter(opts.LogFilter)
+	pat, perr := ParseLogFilter(opts.LogFilter)
 	if perr != nil {
 		_ = slog.Close()
 		return nil, perr
 	}
-	cf, cerr := compileFilter(isRe, pat)
+	cf, cerr := compileFilter(pat)
 	if cerr != nil {
 		_ = slog.Close()
 		return nil, cerr
@@ -349,68 +445,70 @@ func newModel(opts Options) (*model, error) {
 	store := core.NewMapStateStore()
 	sup := core.NewExecSupervisor(bus, store)
 	sup.SetStopGrace(10 * time.Second)
-	ctx := context.Background()
-
-	demos := []struct {
-		id, name string
-	}{
-		{"a", "demo-a"},
-		{"b", "demo-b"},
-		{"c", "demo-c"},
-	}
-	shCmd, shArg := "sh", "-c"
-	if runtime.GOOS == "windows" {
-		shCmd, shArg = "cmd.exe", "/C"
-	}
-	dc, da := demoLongCommand()
-	inner := fmt.Sprintf("%s %s", dc, strings.Join(da, " "))
-	if runtime.GOOS == "windows" {
-		inner = fmt.Sprintf("%s %s", dc, strings.Join(da, " "))
-	}
-
-	names := make([]string, 0, len(demos))
-	ids := make([]core.ProcessID, 0, len(demos))
-	dock := make([]string, 0, len(demos))
-	for _, d := range demos {
-		id := core.ProcessID(d.id)
-		args := []string{shArg, inner}
-		if runtime.GOOS == "windows" {
-			args = []string{shArg, inner}
-		}
-		_ = sup.Register(ctx, core.ProcessSpec{
-			ID:      id,
-			Name:    d.name,
-			Command: shCmd,
-			Args:    args,
-			Restart: core.RestartConfig{Policy: core.RestartNever},
-		})
-		names = append(names, d.name)
-		ids = append(ids, id)
-		dock = append(dock, formatExecLine(shCmd, args))
-	}
 
 	m := &model{
 		sup:            sup,
 		store:          store,
 		bus:            bus,
 		sub:            bus.Subscribe(512),
-		processes:      names,
-		dockCmd:        dock,
-		ids:            ids,
+		processes:      nil,
+		dockCmd:        nil,
+		ids:            nil,
 		selected:       0,
 		slog:           slog,
 		opts:           opts,
 		showStdout:     true,
 		showStderr:     true,
-		filt:           cf,
-		filterIsRegex:  isRe,
-		filterPattern:  pat,
-		filterEditBuf:  pat,
-		filterEditIsRx: isRe,
-		lastBuiltN:     -1,
+		filt:          cf,
+		filterPattern: pat,
+		lastBuiltN:    -1,
 	}
-	_ = m.appendMeta("imux TUI — one merged log for all processes · ? help · / filter · @ timestamps · O/E stdout/stderr · PgUp/PgDn · wheel · g tail · n/e dock")
+	m.addNameInp = newNameLineTI()
+	m.addCmdInp = newCmdLineTI()
+	m.editNameInp = newNameLineTI()
+	m.editCmdInp = newCmdLineTI()
+	m.filterInp = newFilterPatternTI()
+	m.filterInp.SetValue(pat)
+	if len(opts.Bootstrap) > 0 {
+		if err := m.applyBootstrap(opts.Bootstrap); err != nil {
+			_ = slog.Close()
+			return nil, err
+		}
+	}
 	return m, nil
+}
+
+func (m *model) applyBootstrap(procs []BootstrapProc) error {
+	if m.sup == nil {
+		return fmt.Errorf("bootstrap: no supervisor")
+	}
+	ctx := context.Background()
+	for _, p := range procs {
+		line := strings.TrimSpace(p.Line)
+		if line == "" {
+			return fmt.Errorf("bootstrap: empty command for %q", p.ID)
+		}
+		sh, shellArgs := shellWrapUserCommand(line)
+		id := core.ProcessID(strings.TrimSpace(p.ID))
+		spec := core.ProcessSpec{
+			ID:      id,
+			Name:    string(id),
+			Command: sh,
+			Args:    shellArgs,
+			Restart: core.RestartConfig{Policy: core.RestartNever},
+		}
+		if err := m.sup.Register(ctx, spec); err != nil {
+			return fmt.Errorf("bootstrap register %s: %w", id, err)
+		}
+		if err := m.sup.Start(ctx, id); err != nil {
+			return fmt.Errorf("bootstrap start %s: %w", id, err)
+		}
+	}
+	m.refreshProcs()
+	if len(m.ids) > 0 {
+		m.selected = 0
+	}
+	return nil
 }
 
 func (m *model) dispose() {
@@ -421,13 +519,14 @@ func (m *model) dispose() {
 }
 
 func (m *model) logMatchSig() string {
-	return fmt.Sprintf("%s|%v|%v|%v", m.filterPattern, m.filterIsRegex, m.showStdout, m.showStderr)
+	return fmt.Sprintf("%s|%v|%v", m.filterPattern, m.showStdout, m.showStderr)
 }
 
 func (m *model) forceLogRebuild() {
 	m.lastBuiltN = -1
 	m.matchedIdx = nil
 	m.matchSig = ""
+	m.logHScroll = 0
 }
 
 func (m *model) syncLogIndices() error {
@@ -456,6 +555,9 @@ func (m *model) syncLogIndices() error {
 			if err != nil {
 				return err
 			}
+			if !isChildStream(rec) {
+				continue
+			}
 			if !passesStreamToggles(rec, m.showStdout, m.showStderr) {
 				continue
 			}
@@ -465,29 +567,22 @@ func (m *model) syncLogIndices() error {
 			batch = append(batch, i)
 		}
 		m.matchedIdx = append(batch, m.matchedIdx...)
+		// matchedIdx is newest-first; new matches are prepended. If the user has
+		// scrolled up (logScroll > 0), bump scroll by the prepend size so the same
+		// lines stay on screen instead of sliding toward the tail.
+		if m.logScroll > 0 && len(batch) > 0 {
+			m.logScroll += len(batch)
+		}
 		m.lastBuiltN = n
 	}
 	return nil
 }
 
-func (m *model) appendMeta(msg string) error {
-	if m.slog == nil {
-		return nil
-	}
-	return m.slog.Append(sessionlog.Record{
-		K:   sessionlog.KindMeta,
-		Msg: msg,
-		T:   time.Now(),
-	})
-}
-
 func (m *model) applyLogFilter() {
 	m.overlay = overlayNone
-	m.filterIsRegex = m.filterEditIsRx
-	m.filterPattern = strings.TrimSpace(m.filterEditBuf)
-	cf, err := compileFilter(m.filterIsRegex, m.filterPattern)
+	m.filterPattern = strings.TrimSpace(m.filterInp.Value())
+	cf, err := compileFilter(m.filterPattern)
 	if err != nil {
-		m.appendLogLine("filter: " + err.Error())
 		return
 	}
 	m.filt = cf
@@ -508,16 +603,123 @@ func (m *model) currentName() string {
 	return m.processes[m.selected]
 }
 
-func (m *model) appendLogLine(line string) {
-	_ = m.appendMeta(line)
+func (m *model) appendToast(kind ToastKind, msg string) {
+	msg = strings.TrimSpace(msg)
+	if msg == "" {
+		return
+	}
+	m.toastText = msg
+	m.toastKind = kind
+	m.toastDeadline = time.Now().Add(defaultToastLifetime)
+}
+
+func (m *model) nameForID(id core.ProcessID) string {
+	for i := range m.slots {
+		if m.slots[i].ID != id {
+			continue
+		}
+		if n := strings.TrimSpace(m.slots[i].Name); n != "" {
+			return n
+		}
+		break
+	}
+	return string(id)
+}
+
+func (m *model) appendCtlErrFor(op string, id core.ProcessID, displayName string, err error) {
+	dn := strings.TrimSpace(displayName)
+	idStr := string(id)
+	if dn == "" {
+		dn = idStr
+	}
+	subject := dn
+	if dn != idStr && idStr != "" {
+		subject = fmt.Sprintf("%s (%s)", dn, idStr)
+	}
+	if err == nil {
+		m.appendToast(ToastOK, fmt.Sprintf("%s %s", op, subject))
+		return
+	}
+	m.appendToast(ToastErr, fmt.Sprintf("%s %s: %v", op, subject, err))
 }
 
 func (m *model) appendCtlErr(op string, err error) {
-	if err == nil {
-		m.appendLogLine(fmt.Sprintf("[ok] %s %s (%s)", op, m.currentName(), m.currentID()))
+	m.appendCtlErrFor(op, m.currentID(), m.currentName(), err)
+}
+
+func (m *model) startAllGraceful(ctx context.Context) {
+	if m.sup == nil {
 		return
 	}
-	m.appendLogLine(fmt.Sprintf("[error] %s %s (%s): %v", op, m.currentName(), m.currentID(), err))
+	for _, id := range m.ids {
+		st, ok := m.store.Get(id)
+		if !ok {
+			continue
+		}
+		switch st {
+		case core.StatePending, core.StateExited, core.StateFailed:
+			m.appendCtlErrFor("start", id, m.nameForID(id), m.sup.Start(ctx, id))
+		default:
+			// running, starting, paused, stopping: skip
+		}
+	}
+}
+
+func (m *model) stopAllGraceful(ctx context.Context) {
+	if m.sup == nil {
+		return
+	}
+	for _, id := range m.ids {
+		st, ok := m.store.Get(id)
+		if !ok {
+			continue
+		}
+		switch st {
+		case core.StateRunning, core.StateStarting, core.StatePaused:
+			m.appendCtlErrFor("stop", id, m.nameForID(id), m.sup.Stop(ctx, id))
+		default:
+			// pending, exited, failed, stopping: skip
+		}
+	}
+}
+
+func (m *model) pauseAllGraceful(ctx context.Context) {
+	if m.sup == nil {
+		return
+	}
+	for _, id := range m.ids {
+		st, ok := m.store.Get(id)
+		if !ok || st != core.StateRunning {
+			continue
+		}
+		m.appendCtlErrFor("pause", id, m.nameForID(id), m.sup.Pause(ctx, id))
+	}
+}
+
+func (m *model) continueAllGraceful(ctx context.Context) {
+	if m.sup == nil {
+		return
+	}
+	for _, id := range m.ids {
+		st, ok := m.store.Get(id)
+		if !ok || st != core.StatePaused {
+			continue
+		}
+		m.appendCtlErrFor("continue", id, m.nameForID(id), m.sup.Continue(ctx, id))
+	}
+}
+
+func (m *model) restartAllGraceful(ctx context.Context) {
+	if m.sup == nil {
+		return
+	}
+	for _, id := range m.ids {
+		st, ok := m.store.Get(id)
+		if !ok || st == core.StateStopping {
+			continue
+		}
+		m.appendCtlErrFor("restart", id, m.nameForID(id), m.sup.Restart(ctx, id))
+	}
 }
 
 func (m *model) refreshInspector() {
@@ -556,6 +758,84 @@ func (m *model) refreshInspector() {
 	}
 }
 
+func exitCodeFromBusMessage(msg string) (int, bool) {
+	const prefix = "exited with code "
+	if !strings.HasPrefix(msg, prefix) {
+		return 0, false
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(msg[len(prefix):]))
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+func dockStatusWithExit(m *model, id core.ProcessID, st core.ProcessState) string {
+	s := string(st)
+	if st != core.StateExited && st != core.StateFailed {
+		return s
+	}
+	if m.lastExitCode == nil {
+		return s
+	}
+	code, ok := m.lastExitCode[id]
+	if !ok {
+		return s
+	}
+	return fmt.Sprintf("%s %d", s, code)
+}
+
+func (m *model) consumeBusEvent(e core.Event) {
+	switch e.Type {
+	case core.EventProcessOutput:
+		if m.slog == nil {
+			return
+		}
+		k := sessionlog.KindStdout
+		msg := e.Message
+		switch e.Stream {
+		case "e":
+			k = sessionlog.KindStderr
+		case "o", "":
+			k = sessionlog.KindStdout
+		default:
+			k = sessionlog.KindStderr
+			msg = fmt.Sprintf("[stream %q] %s", e.Stream, e.Message)
+		}
+		_ = m.slog.Append(sessionlog.Record{
+			T:    e.Timestamp,
+			K:    k,
+			ID:   string(e.ProcessID),
+			Name: e.ProcessName,
+			Msg:  msg,
+		})
+	case core.EventProcessExited, core.EventProcessFailed:
+		if code, ok := exitCodeFromBusMessage(e.Message); ok {
+			if m.lastExitCode == nil {
+				m.lastExitCode = make(map[core.ProcessID]int)
+			}
+			m.lastExitCode[e.ProcessID] = code
+		}
+	case core.EventProcessStarting, core.EventProcessRunning:
+		if m.lastExitCode != nil {
+			delete(m.lastExitCode, e.ProcessID)
+		}
+	case core.EventProcessSignalSent:
+		if m.slog == nil {
+			return
+		}
+		_ = m.slog.Append(sessionlog.Record{
+			T:    e.Timestamp,
+			K:    sessionlog.KindMeta,
+			ID:   string(e.ProcessID),
+			Name: m.nameForID(e.ProcessID),
+			Msg:  e.Message,
+		})
+	default:
+		return
+	}
+}
+
 func (m *model) drainEvents() {
 	if m.sub == nil {
 		return
@@ -563,36 +843,7 @@ func (m *model) drainEvents() {
 	for {
 		select {
 		case e := <-m.sub:
-			if m.slog == nil {
-				continue
-			}
-			if e.Type == core.EventProcessOutput {
-				k := sessionlog.KindStdout
-				switch e.Stream {
-				case "e":
-					k = sessionlog.KindStderr
-				case "o", "":
-					k = sessionlog.KindStdout
-				default:
-					k = sessionlog.KindMeta
-					e.Message = fmt.Sprintf("stream=%q %s", e.Stream, e.Message)
-				}
-				_ = m.slog.Append(sessionlog.Record{
-					T:    e.Timestamp,
-					K:    k,
-					ID:   string(e.ProcessID),
-					Name: e.ProcessName,
-					Msg:  e.Message,
-				})
-				continue
-			}
-			_ = m.slog.Append(sessionlog.Record{
-				T:    e.Timestamp,
-				K:    sessionlog.KindMeta,
-				ID:   string(e.ProcessID),
-				Name: e.ProcessName,
-				Msg:  fmt.Sprintf("[%s] %s", e.Type, e.Message),
-			})
+			m.consumeBusEvent(e)
 		default:
 			return
 		}
@@ -600,23 +851,32 @@ func (m *model) drainEvents() {
 }
 
 func (m *model) tryAddProcess() {
-	line := strings.TrimSpace(m.addBuf)
+	m.modalErr = ""
+	line := strings.TrimSpace(m.addCmdInp.Value())
 	if line == "" {
-		m.appendLogLine("[error] add process: empty command")
+		m.modalErr = "Add: empty command"
 		return
 	}
 	if m.sup == nil {
-		m.appendLogLine("[error] add process: no supervisor")
+		m.modalErr = "Add: no supervisor"
 		return
 	}
 	sh, shellArgs := shellWrapUserCommand(line)
 	ctx := context.Background()
-	name := sanitizeDisplayName(m.addNameBuf)
+	name := sanitizeDisplayName(m.addNameInp.Value())
 	if name == "" {
 		name = nameFromCommandLine(line)
 	}
 	if name == "" {
 		name = "proc"
+	}
+	specs, err := m.sup.List(ctx)
+	if err != nil {
+		m.modalErr = fmt.Sprintf("Add: %v", err)
+		return
+	}
+	if _, dup := displayNameConflicts(specs, "", name); dup {
+		return
 	}
 	for tries := 0; tries < 64; tries++ {
 		m.nextUserSeq++
@@ -633,14 +893,10 @@ func (m *model) tryAddProcess() {
 			if strings.Contains(err.Error(), "already exists") {
 				continue
 			}
-			m.appendLogLine(fmt.Sprintf("[error] add process: register: %v", err))
+			m.modalErr = fmt.Sprintf("Register: %v", err)
 			return
 		}
-		if err := m.sup.Start(ctx, id); err != nil {
-			m.appendLogLine(fmt.Sprintf("[error] add process %s: start failed (registered, use s to retry): %v", id, err))
-		} else {
-			m.appendLogLine(fmt.Sprintf("[ok] added process %s (%s)", id, name))
-		}
+		m.appendToast(ToastOK, fmt.Sprintf("Registered %s (%s); press s to start", id, name))
 		m.refreshProcs()
 		for i, pid := range m.ids {
 			if pid == id {
@@ -651,43 +907,129 @@ func (m *model) tryAddProcess() {
 		m.resetLineOverlay()
 		return
 	}
-	m.appendLogLine("[error] add process: could not allocate id")
+	m.modalErr = "Add: could not allocate id"
 }
 
 func (m *model) resetLineOverlay() {
-	m.addBuf = ""
-	m.addNameBuf = ""
-	m.editBuf = ""
-	m.editNameBuf = ""
+	m.addNameInp.Reset()
+	m.addCmdInp.Reset()
+	m.editNameInp.Reset()
+	m.editCmdInp.Reset()
 	m.editTargetID = ""
 	m.lineOverlayField = lineFormNameField
+	m.modalErr = ""
 	m.overlay = overlayNone
 }
 
+func (m *model) deletePrevalidate(id core.ProcessID) error {
+	if m.sup == nil {
+		return fmt.Errorf("no supervisor")
+	}
+	if id == "" {
+		return fmt.Errorf("no process selected")
+	}
+	st, ok := m.store.Get(id)
+	if !ok {
+		return fmt.Errorf("unknown process")
+	}
+	if st == core.StateRunning || st == core.StateStarting || st == core.StatePaused || st == core.StateStopping {
+		return fmt.Errorf("stop the process before removing its slot")
+	}
+	return nil
+}
+
+func (m *model) tryDeleteProcess() {
+	if m.sup == nil {
+		return
+	}
+	id := m.currentID()
+	if err := m.deletePrevalidate(id); err != nil {
+		m.appendToast(ToastErr, "Delete: "+err.Error())
+		return
+	}
+	ctx := context.Background()
+	if err := m.sup.Unregister(ctx, id); err != nil {
+		m.appendToast(ToastErr, fmt.Sprintf("Delete: %v", err))
+		return
+	}
+	m.appendToast(ToastOK, fmt.Sprintf("Removed slot %s", id))
+	if m.pendingStop && m.pendingStopID == id {
+		m.clearPendingStop()
+	}
+	m.refreshProcs()
+	if m.selected >= len(m.ids) {
+		m.selected = len(m.ids) - 1
+	}
+	if m.selected < 0 {
+		m.selected = 0
+	}
+	m.clampDockScroll(m.dockVisibleCount())
+	m.forceLogRebuild()
+}
+
+// openEditProcessFromMain opens the edit overlay for the selected dock slot.
+// Saving while a child is running stops it automatically, then applies the new spec.
+func (m *model) openEditProcessFromMain() tea.Cmd {
+	if m.sup == nil {
+		return nil
+	}
+	if m.overlay == overlayInspector {
+		m.overlay = overlayNone
+	}
+	if m.overlay == overlayAddProcess || m.overlay == overlayEditProcess || m.overlay == overlayLogFilter || m.overlay == overlayKillSignal {
+		return nil
+	}
+	id := m.currentID()
+	if id == "" {
+		return nil
+	}
+	ctx := context.Background()
+	specs, err := m.sup.List(ctx)
+	if err != nil {
+		m.appendToast(ToastErr, fmt.Sprintf("Edit: %v", err))
+		return nil
+	}
+	var spec *core.ProcessSpec
+	for i := range specs {
+		if specs[i].ID == id {
+			spec = &specs[i]
+			break
+		}
+	}
+	if spec == nil {
+		m.appendToast(ToastErr, "Edit: process not found")
+		return nil
+	}
+	m.editTargetID = id
+	m.editNameInp.SetValue(spec.Name)
+	m.editCmdInp.SetValue(innerCommandForEdit(*spec))
+	m.lineOverlayField = lineFormNameField
+	m.modalErr = ""
+	m.overlay = overlayEditProcess
+	m.syncLineFormWidths(m.lineFormInnerW())
+	return m.refocusLineFormCurrent()
+}
+
 func (m *model) tryEditProcess() {
-	line := strings.TrimSpace(m.editBuf)
+	m.modalErr = ""
+	line := strings.TrimSpace(m.editCmdInp.Value())
 	id := m.editTargetID
 	if id == "" {
 		m.resetLineOverlay()
 		return
 	}
 	if line == "" {
-		m.appendLogLine("[error] edit process: empty command")
+		m.modalErr = "Edit: empty command"
 		return
 	}
 	if m.sup == nil {
-		m.appendLogLine("[error] edit process: no supervisor")
-		return
-	}
-	st, ok := m.store.Get(id)
-	if ok && (st == core.StateRunning || st == core.StateStarting || st == core.StatePaused || st == core.StateStopping) {
-		m.appendLogLine("[error] edit process: stop the process before editing the command")
+		m.modalErr = "Edit: no supervisor"
 		return
 	}
 	ctx := context.Background()
 	specs, err := m.sup.List(ctx)
 	if err != nil {
-		m.appendLogLine(fmt.Sprintf("[error] edit process: list: %v", err))
+		m.modalErr = fmt.Sprintf("Edit: list: %v", err)
 		return
 	}
 	var oldSpec core.ProcessSpec
@@ -700,40 +1042,50 @@ func (m *model) tryEditProcess() {
 		}
 	}
 	if !found {
-		m.appendLogLine("[error] edit process: process not found")
-		return
-	}
-	if err := m.sup.Unregister(ctx, id); err != nil {
-		m.appendLogLine(fmt.Sprintf("[error] edit process: unregister: %v", err))
+		m.modalErr = "Edit: process not found"
 		return
 	}
 	sh, shellArgs := shellWrapUserCommand(line)
-	name := sanitizeDisplayName(m.editNameBuf)
+	name := sanitizeDisplayName(m.editNameInp.Value())
 	if name == "" {
 		name = nameFromCommandLine(line)
 	}
 	if name == "" {
 		name = "proc"
 	}
+	if _, dup := displayNameConflicts(specs, id, name); dup {
+		return
+	}
 	spec := core.ProcessSpec{
 		ID:      id,
 		Name:    name,
 		Command: sh,
 		Args:    shellArgs,
-		Restart: core.RestartConfig{Policy: core.RestartNever},
+		Env:     oldSpec.Env,
+		Dir:     oldSpec.Dir,
+		Restart: oldSpec.Restart,
 	}
-	if err := m.sup.Register(ctx, spec); err != nil {
-		m.appendLogLine(fmt.Sprintf("[error] edit process: register: %v", err))
-		if rerr := m.sup.Register(ctx, oldSpec); rerr != nil {
-			m.appendLogLine(fmt.Sprintf("[error] edit process: could not restore previous definition: %v", rerr))
-		} else {
-			m.appendLogLine("[ok] edit aborted; restored previous command")
+	stoppedToSave := false
+	err = m.sup.ReplaceSpec(ctx, id, spec)
+	if err != nil && strings.Contains(err.Error(), "still has an active child") {
+		if stopErr := m.sup.Stop(ctx, id); stopErr != nil {
+			m.modalErr = fmt.Sprintf("Edit: replace blocked while running; stop failed: %v", stopErr)
+			m.refreshProcs()
+			return
 		}
+		err = m.sup.ReplaceSpec(ctx, id, spec)
+		stoppedToSave = err == nil
+	}
+	if err != nil {
+		m.modalErr = modalSaveErrMessage(err)
 		m.refreshProcs()
-		m.resetLineOverlay()
 		return
 	}
-	m.appendLogLine(fmt.Sprintf("[ok] updated definition for %s (%s); press s when you want it running", id, name))
+	if stoppedToSave {
+		m.appendToast(ToastOK, fmt.Sprintf("Stopped and saved %s (%s); press s to run when ready", id, name))
+	} else {
+		m.appendToast(ToastOK, fmt.Sprintf("Updated %s (%s); press s to run when ready", id, name))
+	}
 	m.refreshProcs()
 	for i, pid := range m.ids {
 		if pid == id {
@@ -753,24 +1105,199 @@ func (m *model) refreshProcs() {
 		return
 	}
 	sort.Slice(specs, func(i, j int) bool { return specs[i].ID < specs[j].ID })
-	names := make([]string, len(specs))
-	ids := make([]core.ProcessID, len(specs))
-	dock := make([]string, len(specs))
-	for i, sp := range specs {
-		names[i] = sp.Name
-		ids[i] = sp.ID
-		dock[i] = formatExecLine(sp.Command, sp.Args)
+
+	specIDs := make(map[core.ProcessID]struct{}, len(specs))
+	for _, sp := range specs {
+		specIDs[sp.ID] = struct{}{}
+	}
+
+	for i := range m.slots {
+		if m.slots[i].Deleted {
+			continue
+		}
+		if _, ok := specIDs[m.slots[i].ID]; !ok {
+			m.slots[i].Deleted = true
+			if m.lastExitCode != nil {
+				delete(m.lastExitCode, m.slots[i].ID)
+			}
+		}
+	}
+
+	for _, sp := range specs {
+		found := false
+		for i := range m.slots {
+			if m.slots[i].ID != sp.ID {
+				continue
+			}
+			found = true
+			m.slots[i].Deleted = false
+			m.slots[i].Name = sp.Name
+			m.slots[i].DockCmd = formatExecLine(sp.Command, sp.Args)
+			break
+		}
+		if !found {
+			m.slots = append(m.slots, dockSlot{
+				ID:      sp.ID,
+				Name:    sp.Name,
+				DockCmd: formatExecLine(sp.Command, sp.Args),
+				Deleted: false,
+			})
+		}
+	}
+
+	m.rebuildVisibleDockCaches()
+}
+
+func (m *model) rebuildVisibleDockCaches() {
+	names := make([]string, 0, len(m.slots))
+	ids := make([]core.ProcessID, 0, len(m.slots))
+	cmds := make([]string, 0, len(m.slots))
+	for _, sl := range m.slots {
+		if sl.Deleted {
+			continue
+		}
+		names = append(names, sl.Name)
+		ids = append(ids, sl.ID)
+		cmds = append(cmds, sl.DockCmd)
 	}
 	m.processes = names
-	m.dockCmd = dock
 	m.ids = ids
-	if m.selected >= len(m.ids) {
-		m.selected = len(m.ids) - 1
-	}
-	if m.selected < 0 {
+	m.dockCmd = cmds
+	if len(m.ids) == 0 {
 		m.selected = 0
+	} else {
+		if m.selected >= len(m.ids) {
+			m.selected = len(m.ids) - 1
+		}
+		if m.selected < 0 {
+			m.selected = 0
+		}
 	}
 	m.clampDockScroll(m.dockVisibleCount())
+}
+
+func (m *model) clearPendingQuit() {
+	m.pendingQuit = false
+	m.pendingQuitDeadline = time.Time{}
+}
+
+func (m *model) clearPendingDelete() {
+	m.pendingDelete = false
+	m.pendingDeleteDeadline = time.Time{}
+	m.pendingDeleteID = ""
+}
+
+func (m *model) clearPendingStop() {
+	m.pendingStop = false
+	m.pendingStopDeadline = time.Time{}
+	m.pendingStopID = ""
+}
+
+func (m *model) clearPendingStopAll() {
+	m.pendingStopAll = false
+	m.pendingStopAllDeadline = time.Time{}
+}
+
+func (m *model) closeKillSignalOverlay() {
+	m.killSignalTargetID = ""
+	m.killSignalSel = 0
+	m.killSignalBulkAll = false
+	if m.overlay == overlayKillSignal {
+		m.overlay = overlayNone
+	}
+}
+
+func (m *model) killableRunningCount() int {
+	n := 0
+	for _, id := range m.ids {
+		st, ok := m.store.Get(id)
+		if !ok {
+			continue
+		}
+		switch st {
+		case core.StateRunning, core.StateStarting, core.StatePaused:
+			n++
+		}
+	}
+	return n
+}
+
+func (m *model) applyKillSignalChoice() {
+	menu := killSignalMenu()
+	if len(menu) == 0 || m.killSignalSel < 0 || m.killSignalSel >= len(menu) {
+		m.closeKillSignalOverlay()
+		return
+	}
+	if m.sup == nil {
+		m.closeKillSignalOverlay()
+		return
+	}
+	choice := menu[m.killSignalSel].sig
+	ctx := context.Background()
+	if m.killSignalBulkAll {
+		for _, id := range m.ids {
+			st, ok := m.store.Get(id)
+			if !ok {
+				continue
+			}
+			switch st {
+			case core.StateRunning, core.StateStarting, core.StatePaused:
+				m.appendCtlErrFor("signal", id, m.nameForID(id), m.sup.SendUserSignal(ctx, id, choice))
+			}
+		}
+		m.closeKillSignalOverlay()
+		m.refreshProcs()
+		return
+	}
+	id := m.killSignalTargetID
+	if id == "" {
+		m.closeKillSignalOverlay()
+		return
+	}
+	m.appendCtlErrFor("signal", id, m.nameForID(id), m.sup.SendUserSignal(ctx, id, choice))
+	m.closeKillSignalOverlay()
+	m.refreshProcs()
+}
+
+// stopArmEligible is true when Stop is meaningful for this process (matches bulk stop rules).
+func (m *model) stopArmEligible(id core.ProcessID) bool {
+	if id == "" {
+		return false
+	}
+	st, ok := m.store.Get(id)
+	if !ok {
+		return false
+	}
+	switch st {
+	case core.StateRunning, core.StateStarting, core.StatePaused:
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *model) anyStoppableProcess() bool {
+	for _, id := range m.ids {
+		if m.stopArmEligible(id) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *model) anyKillableProcess() bool {
+	for _, id := range m.ids {
+		st, ok := m.store.Get(id)
+		if !ok {
+			continue
+		}
+		switch st {
+		case core.StateRunning, core.StateStarting, core.StatePaused:
+			return true
+		default:
+		}
+	}
+	return false
 }
 
 func (m *model) shutdownProcs() {
@@ -790,15 +1317,36 @@ func (m *model) shutdownProcs() {
 }
 
 func (m *model) Init() tea.Cmd {
-	return tickCmd()
+	return tea.Batch(tickCmd(), m.listenCmd())
 }
 
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case busEventMsg:
+		m.consumeBusEvent(core.Event(msg))
+		m.drainEvents()
+		return m, m.listenCmd()
 	case tickMsg:
 		m.tick++
 		m.drainEvents()
 		m.refreshProcs()
+		if m.pendingQuit && !m.pendingQuitDeadline.IsZero() && time.Now().After(m.pendingQuitDeadline) {
+			m.clearPendingQuit()
+		}
+		if m.pendingDelete && !m.pendingDeleteDeadline.IsZero() && time.Now().After(m.pendingDeleteDeadline) {
+			m.clearPendingDelete()
+		}
+		if m.pendingStop && !m.pendingStopDeadline.IsZero() && time.Now().After(m.pendingStopDeadline) {
+			m.clearPendingStop()
+		}
+		if m.pendingStopAll && !m.pendingStopAllDeadline.IsZero() && time.Now().After(m.pendingStopAllDeadline) {
+			m.clearPendingStopAll()
+		}
+		if !m.toastDeadline.IsZero() && time.Now().After(m.toastDeadline) {
+			m.toastText = ""
+			m.toastDeadline = time.Time{}
+			m.toastKind = ToastNeutral
+		}
 		if m.overlay == overlayInspector && m.tick%3 == 0 {
 			m.refreshInspector()
 		}
@@ -807,64 +1355,235 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.clampDockScroll(m.dockVisibleCount())
+		if m.overlay == overlayAddProcess || m.overlay == overlayEditProcess {
+			m.syncLineFormWidths(m.lineFormInnerW())
+		}
+		if m.overlay == overlayLogFilter {
+			m.syncFilterInpWidth(m.lineFormInnerW())
+		}
 	case tea.MouseMsg:
 		logH, _ := m.layoutHeights()
 		if msg.Y >= logH {
 			break
 		}
-		if msg.Action != tea.MouseActionPress {
+		me := tea.MouseEvent(msg)
+		// Many terminals (e.g. macOS) translate Shift+vertical wheel into horizontal
+		// wheel buttons with Shift=false; accept wheel regardless of press vs release
+		// where some emulators differ.
+		if !me.IsWheel() && me.Action != tea.MouseActionPress {
+			break
+		}
+		if me.IsWheel() && me.Action == tea.MouseActionMotion {
 			break
 		}
 		switch msg.Button {
-		case tea.MouseButtonWheelDown:
-			m.logScroll += 3
-		case tea.MouseButtonWheelUp:
-			if m.logScroll >= 3 {
-				m.logScroll -= 3
+		case tea.MouseButtonWheelLeft:
+			// Usually paired with Shift+wheel up (see WheelRight comment).
+			if m.logHScroll >= 3 {
+				m.logHScroll -= 3
 			} else {
-				m.logScroll = 0
+				m.logHScroll = 0
+			}
+		case tea.MouseButtonWheelRight:
+			// Many terminals send this instead of Shift+vertical wheel for horizontal scroll.
+			m.logHScroll += 3
+		case tea.MouseButtonWheelDown:
+			if msg.Shift {
+				m.logHScroll += 3
+			} else {
+				// Toward tail (newer); logScroll counts back from newest matching line.
+				if m.logScroll >= 3 {
+					m.logScroll -= 3
+				} else {
+					m.logScroll = 0
+				}
+			}
+		case tea.MouseButtonWheelUp:
+			if msg.Shift {
+				if m.logHScroll >= 3 {
+					m.logHScroll -= 3
+				} else {
+					m.logHScroll = 0
+				}
+			} else {
+				m.logScroll += 3
 			}
 		}
 	case tea.KeyMsg:
-		if m.overlay == overlayLogFilter {
+		if m.overlay == overlayKillSignal {
 			if msg.String() == "?" {
-				m.helpReturnTo = overlayLogFilter
+				m.helpReturnTo = overlayKillSignal
 				m.overlay = overlayHelp
 				return m, nil
 			}
 			switch msg.String() {
-			case "ctrl+c":
-				m.shutdownProcs()
-				return m, tea.Quit
-			case "esc":
-				m.overlay = overlayNone
+			case "ctrl+c", "esc":
+				m.closeKillSignalOverlay()
+				m.clearPendingQuit()
+				return m, nil
 			case "enter":
-				m.applyLogFilter()
-			case "tab":
-				m.filterEditIsRx = !m.filterEditIsRx
-			case "backspace":
-				m.filterEditBuf = trimLastRune(m.filterEditBuf)
-			default:
-				if msg.Type == tea.KeyRunes {
-					m.filterEditBuf += string(msg.Runes)
-					if len(m.filterEditBuf) > 512 {
-						m.filterEditBuf = m.filterEditBuf[:512]
+				m.applyKillSignalChoice()
+				return m, nil
+			}
+			switch msg.Type {
+			case tea.KeyUp:
+				n := len(killSignalMenu())
+				if n > 0 {
+					m.killSignalSel--
+					if m.killSignalSel < 0 {
+						m.killSignalSel = n - 1
 					}
 				}
+				return m, nil
+			case tea.KeyDown:
+				n := len(killSignalMenu())
+				if n > 0 {
+					m.killSignalSel++
+					if m.killSignalSel >= n {
+						m.killSignalSel = 0
+					}
+				}
+				return m, nil
 			}
 			return m, nil
 		}
-		if m.overlay != overlayAddProcess && m.overlay != overlayEditProcess {
+		if m.overlay == overlayLogFilter {
+			if msg.String() == "?" {
+				m.helpReturnTo = overlayLogFilter
+				m.overlay = overlayHelp
+				m.filterInp.Blur()
+				return m, nil
+			}
+			switch msg.String() {
+			case "ctrl+c":
+				m.overlay = overlayNone
+				m.clearPendingQuit()
+				m.filterInp.Blur()
+			case "esc":
+				m.overlay = overlayNone
+				m.filterInp.Blur()
+			case "enter":
+				m.applyLogFilter()
+				m.filterInp.Blur()
+			default:
+				var cmd tea.Cmd
+				m.filterInp, cmd = m.filterInp.Update(msg)
+				return m, cmd
+			}
+			return m, nil
+		}
+		// Help opened from the main view (?): any shortcut runs on the main UI; the
+		// sheet closes first (Esc, ?, q, Ctrl+c still only dismiss/return as below).
+		if m.overlay == overlayHelp && m.helpReturnTo == overlayNone {
+			switch msg.String() {
+			case "?", "esc", "ctrl+c", "q":
+				// handled in the shared key switch below
+			default:
+				m.overlay = overlayNone
+				m.helpReturnTo = overlayNone
+				return m.Update(msg)
+			}
+		}
+		if msg.String() != "q" && msg.String() != "ctrl+c" && m.pendingQuit {
+			m.clearPendingQuit()
+		}
+		if msg.String() != "d" && m.pendingDelete {
+			m.clearPendingDelete()
+		}
+		if msg.String() != "t" && m.pendingStop {
+			m.clearPendingStop()
+		}
+		if msg.String() != "T" && m.pendingStopAll {
+			m.clearPendingStopAll()
+		}
+		if m.overlay != overlayAddProcess && m.overlay != overlayEditProcess && m.overlay != overlayKillSignal {
 			switch msg.Type {
 			case tea.KeyPgUp:
-				m.logScroll += 5
+				logH, _ := m.layoutHeights()
+				page := max(1, logH)
+				m.logScroll += page
 				return m, nil
 			case tea.KeyPgDown:
-				if m.logScroll >= 5 {
-					m.logScroll -= 5
+				logH, _ := m.layoutHeights()
+				page := max(1, logH)
+				if m.logScroll >= page {
+					m.logScroll -= page
 				} else {
 					m.logScroll = 0
 				}
+				return m, nil
+			case tea.KeyHome:
+				if m.overlay == overlayHelp {
+					break
+				}
+				_ = m.syncLogIndices()
+				logH, _ := m.layoutHeights()
+				page := max(1, logH)
+				if n := len(m.matchedIdx); n > 0 {
+					// Align with PgUp page size: show a full viewport of the oldest
+					// lines. scrollBack=len-1 would only pass one index into the window.
+					m.logScroll = max(0, n-page)
+				} else {
+					m.logScroll = 0
+				}
+				m.logHScroll = 0
+				return m, nil
+			case tea.KeyEnd:
+				if m.overlay == overlayHelp {
+					break
+				}
+				m.logScroll = 0
+				m.logHScroll = 0
+				return m, nil
+			case tea.KeyUp:
+				if m.overlay == overlayHelp {
+					break
+				}
+				m.logScroll += 3
+				return m, nil
+			case tea.KeyDown:
+				if m.overlay == overlayHelp {
+					break
+				}
+				if m.logScroll >= 3 {
+					m.logScroll -= 3
+				} else {
+					m.logScroll = 0
+				}
+				return m, nil
+			case tea.KeyShiftUp:
+				if m.overlay == overlayHelp {
+					break
+				}
+				if m.selected > 0 {
+					m.selected--
+					m.clampDockScroll(m.dockVisibleCount())
+				}
+				return m, nil
+			case tea.KeyShiftDown:
+				if m.overlay == overlayHelp {
+					break
+				}
+				if m.selected < len(m.processes)-1 {
+					m.selected++
+					m.clampDockScroll(m.dockVisibleCount())
+				}
+				return m, nil
+			case tea.KeyLeft:
+				if m.overlay == overlayHelp {
+					break
+				}
+				if m.logHScroll >= 3 {
+					m.logHScroll -= 3
+				} else {
+					m.logHScroll = 0
+				}
+				return m, nil
+			case tea.KeyRight:
+				if m.overlay == overlayHelp {
+					break
+				}
+				m.logHScroll += 3
 				return m, nil
 			}
 		}
@@ -873,90 +1592,97 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if msg.String() == "?" {
 				m.helpReturnTo = m.overlay
 				m.overlay = overlayHelp
+				m.blurAllLineInputs()
 				return m, nil
 			}
 			switch msg.String() {
 			case "ctrl+c":
-				m.shutdownProcs()
-				return m, tea.Quit
+				m.resetLineOverlay()
+				m.clearPendingQuit()
+				return m, nil
 			case "esc":
 				m.resetLineOverlay()
+				return m, nil
 			case "enter":
 				if edit {
 					m.tryEditProcess()
 				} else {
 					m.tryAddProcess()
 				}
-			case "backspace":
-				if edit {
-					if m.lineOverlayField == lineFormNameField {
-						m.editNameBuf = trimLastRune(m.editNameBuf)
-					} else {
-						m.editBuf = trimLastRune(m.editBuf)
-					}
-				} else {
-					if m.lineOverlayField == lineFormNameField {
-						m.addNameBuf = trimLastRune(m.addNameBuf)
-					} else {
-						m.addBuf = trimLastRune(m.addBuf)
-					}
+				// Keep cursor blink / focus after a failed save (textinput stops scheduling blink without a Focus cmd).
+				if m.overlay == overlayAddProcess || m.overlay == overlayEditProcess {
+					return m, m.refocusLineFormCurrent()
 				}
-			case "tab":
+				return m, nil
+			case "tab", "shift+tab":
+				m.modalErr = ""
 				if m.lineOverlayField == lineFormNameField {
 					m.lineOverlayField = lineFormCmdField
 				} else {
 					m.lineOverlayField = lineFormNameField
 				}
-			default:
-				switch msg.Type {
-				case tea.KeyRunes:
-					if edit {
-						if m.lineOverlayField == lineFormNameField {
-							m.editNameBuf += string(msg.Runes)
-							if len(m.editNameBuf) > 256 {
-								m.editNameBuf = m.editNameBuf[:256]
-							}
-						} else {
-							m.editBuf += string(msg.Runes)
-							if len(m.editBuf) > 4000 {
-								m.editBuf = m.editBuf[:4000]
-							}
-						}
-					} else {
-						if m.lineOverlayField == lineFormNameField {
-							m.addNameBuf += string(msg.Runes)
-							if len(m.addNameBuf) > 256 {
-								m.addNameBuf = m.addNameBuf[:256]
-							}
-						} else {
-							m.addBuf += string(msg.Runes)
-							if len(m.addBuf) > 4000 {
-								m.addBuf = m.addBuf[:4000]
-							}
-						}
-					}
-				case tea.KeySpace:
-					if edit {
-						if m.lineOverlayField == lineFormNameField {
-							m.editNameBuf += " "
-						} else {
-							m.editBuf += " "
-						}
-					} else {
-						if m.lineOverlayField == lineFormNameField {
-							m.addNameBuf += " "
-						} else {
-							m.addBuf += " "
-						}
-					}
-				}
+				m.syncLineFormWidths(m.lineFormInnerW())
+				return m, m.refocusLineFormCurrent()
 			}
-			return m, nil
+			if msg.Type == tea.KeyUp || msg.Type == tea.KeyDown {
+				m.modalErr = ""
+				if m.lineOverlayField == lineFormNameField {
+					m.lineOverlayField = lineFormCmdField
+				} else {
+					m.lineOverlayField = lineFormNameField
+				}
+				m.syncLineFormWidths(m.lineFormInnerW())
+				return m, m.refocusLineFormCurrent()
+			}
+			m.modalErr = ""
+			cmd := m.dispatchLineFormUpdate(msg, edit)
+			return m, cmd
 		}
 		switch msg.String() {
 		case "ctrl+c", "q":
-			m.shutdownProcs()
-			return m, tea.Quit
+			switch m.overlay {
+			case overlayHelp:
+				m.overlay = m.helpReturnTo
+				m.helpReturnTo = overlayNone
+				m.clearPendingQuit()
+				m.clearPendingDelete()
+				m.clearPendingStop()
+				m.clearPendingStopAll()
+				if m.overlay == overlayAddProcess || m.overlay == overlayEditProcess {
+					m.syncLineFormWidths(m.lineFormInnerW())
+					return m, m.refocusLineFormCurrent()
+				}
+				if m.overlay == overlayLogFilter {
+					m.syncFilterInpWidth(m.lineFormInnerW())
+					return m, m.filterInp.Focus()
+				}
+				if m.overlay == overlayKillSignal {
+					return m, nil
+				}
+				return m, nil
+			case overlayNone:
+				if m.pendingQuit && !m.pendingQuitDeadline.IsZero() && time.Now().Before(m.pendingQuitDeadline) {
+					m.shutdownProcs()
+					return m, tea.Quit
+				}
+				m.clearPendingDelete()
+				m.clearPendingStop()
+				m.clearPendingStopAll()
+				m.pendingQuit = true
+				m.pendingQuitDeadline = time.Now().Add(pendingConfirmWindow)
+				return m, nil
+			default:
+				if m.overlay == overlayKillSignal {
+					m.closeKillSignalOverlay()
+				} else {
+					m.overlay = overlayNone
+				}
+				m.clearPendingQuit()
+				m.clearPendingDelete()
+				m.clearPendingStop()
+				m.clearPendingStopAll()
+				return m, nil
+			}
 		case "1", "2", "3", "4", "5", "6", "7", "8", "9":
 			if m.overlay == overlayHelp {
 				break
@@ -970,49 +1696,122 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.overlay == overlayHelp {
 				m.overlay = m.helpReturnTo
 				m.helpReturnTo = overlayNone
+				if m.overlay == overlayAddProcess || m.overlay == overlayEditProcess {
+					m.syncLineFormWidths(m.lineFormInnerW())
+					return m, m.refocusLineFormCurrent()
+				}
+				if m.overlay == overlayLogFilter {
+					m.syncFilterInpWidth(m.lineFormInnerW())
+					return m, m.filterInp.Focus()
+				}
+				if m.overlay == overlayKillSignal {
+					return m, nil
+				}
 			} else {
-				m.helpReturnTo = m.overlay
+				prev := m.overlay
+				m.helpReturnTo = prev
 				m.overlay = overlayHelp
+				if prev == overlayAddProcess || prev == overlayEditProcess {
+					m.blurAllLineInputs()
+				}
+				if prev == overlayLogFilter {
+					m.filterInp.Blur()
+				}
 			}
 		case "esc":
 			if m.overlay == overlayHelp {
 				m.overlay = m.helpReturnTo
 				m.helpReturnTo = overlayNone
+				if m.overlay == overlayAddProcess || m.overlay == overlayEditProcess {
+					m.syncLineFormWidths(m.lineFormInnerW())
+					return m, m.refocusLineFormCurrent()
+				}
+				if m.overlay == overlayLogFilter {
+					m.syncFilterInpWidth(m.lineFormInnerW())
+					return m, m.filterInp.Focus()
+				}
+				if m.overlay == overlayKillSignal {
+					return m, nil
+				}
 			} else if m.overlay != overlayNone {
-				m.overlay = overlayNone
+				if m.overlay == overlayKillSignal {
+					m.closeKillSignalOverlay()
+				} else {
+					m.overlay = overlayNone
+				}
+			} else {
+				if m.pendingQuit {
+					m.clearPendingQuit()
+				}
+				if m.pendingDelete {
+					m.clearPendingDelete()
+				}
+				if m.pendingStop {
+					m.clearPendingStop()
+				}
+				if m.pendingStopAll {
+					m.clearPendingStopAll()
+				}
 			}
-		case "g":
-			if m.overlay == overlayHelp {
-				break
-			}
-			m.logScroll = 0
-		case "O":
+		case "o":
 			if m.overlay == overlayHelp {
 				break
 			}
 			m.showStdout = !m.showStdout
 			m.forceLogRebuild()
-		case "E":
+		case "e":
 			if m.overlay == overlayHelp {
 				break
 			}
 			m.showStderr = !m.showStderr
 			m.forceLogRebuild()
-		case "@":
+		case "P":
 			if m.overlay == overlayHelp {
 				break
 			}
-			m.showTime = !m.showTime
+			m.logTimePrec = m.logTimePrec.prev()
+		case "p":
+			if m.overlay == overlayHelp {
+				break
+			}
+			m.logTimePrec = m.logTimePrec.next()
+		case "tab":
+			if m.overlay == overlayHelp {
+				break
+			}
+			if m.overlay != overlayNone {
+				break
+			}
+			n := len(m.processes)
+			if n == 0 {
+				break
+			}
+			m.selected = (m.selected + 1) % n
+			m.clampDockScroll(m.dockVisibleCount())
+		case "shift+tab":
+			if m.overlay == overlayHelp {
+				break
+			}
+			if m.overlay != overlayNone {
+				break
+			}
+			n := len(m.processes)
+			if n == 0 {
+				break
+			}
+			m.selected = (m.selected - 1 + n) % n
+			m.clampDockScroll(m.dockVisibleCount())
 		case "/":
 			if m.overlay == overlayHelp {
 				break
 			}
-			if m.overlay == overlayAddProcess || m.overlay == overlayEditProcess {
+			if m.overlay == overlayAddProcess || m.overlay == overlayEditProcess || m.overlay == overlayKillSignal {
 				break
 			}
 			m.overlay = overlayLogFilter
-			m.filterEditBuf = m.filterPattern
-			m.filterEditIsRx = m.filterIsRegex
+			m.filterInp.SetValue(m.filterPattern)
+			m.syncFilterInpWidth(m.lineFormInnerW())
+			return m, m.filterInp.Focus()
 		case "n":
 			if m.overlay == overlayHelp {
 				break
@@ -1020,54 +1819,127 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.overlay == overlayInspector {
 				m.overlay = overlayNone
 			}
-			if m.overlay == overlayAddProcess || m.overlay == overlayEditProcess {
+			if m.overlay == overlayAddProcess || m.overlay == overlayEditProcess || m.overlay == overlayLogFilter || m.overlay == overlayKillSignal {
 				break
 			}
 			m.overlay = overlayAddProcess
-			m.addBuf = ""
-			m.addNameBuf = ""
+			m.modalErr = ""
 			m.lineOverlayField = lineFormNameField
-		case "e":
+			m.addNameInp.Reset()
+			m.addCmdInp.Reset()
+			m.syncLineFormWidths(m.lineFormInnerW())
+			return m, m.refocusLineFormCurrent()
+		case "d":
 			if m.overlay == overlayHelp {
 				break
 			}
 			if m.overlay == overlayInspector {
 				m.overlay = overlayNone
 			}
-			if m.overlay == overlayAddProcess || m.overlay == overlayEditProcess {
+			if m.overlay == overlayAddProcess || m.overlay == overlayEditProcess || m.overlay == overlayLogFilter || m.overlay == overlayKillSignal {
+				break
+			}
+			if m.sup == nil {
+				break
+			}
+			id := m.currentID()
+			if m.pendingDelete {
+				if time.Now().After(m.pendingDeleteDeadline) || m.pendingDeleteID != id {
+					m.clearPendingDelete()
+				}
+			}
+			if m.pendingDelete && m.pendingDeleteID == id && time.Now().Before(m.pendingDeleteDeadline) {
+				m.clearPendingDelete()
+				m.tryDeleteProcess()
+				break
+			}
+			if err := m.deletePrevalidate(id); err != nil {
+				m.appendToast(ToastErr, "Delete: "+err.Error())
+				break
+			}
+			m.clearPendingQuit()
+			m.clearPendingStop()
+			m.clearPendingStopAll()
+			m.pendingDelete = true
+			m.pendingDeleteDeadline = time.Now().Add(pendingConfirmWindow)
+			m.pendingDeleteID = id
+		case "T":
+			if m.overlay == overlayHelp {
+				break
+			}
+			if m.overlay == overlayInspector {
+				m.overlay = overlayNone
+			}
+			if m.overlay == overlayAddProcess || m.overlay == overlayEditProcess || m.overlay == overlayLogFilter || m.overlay == overlayKillSignal {
+				break
+			}
+			if m.sup == nil {
+				break
+			}
+			if m.pendingStopAll {
+				if time.Now().After(m.pendingStopAllDeadline) {
+					m.clearPendingStopAll()
+				}
+			}
+			if m.pendingStopAll && time.Now().Before(m.pendingStopAllDeadline) {
+				m.clearPendingStopAll()
+				m.clearPendingStop()
+				m.clearPendingQuit()
+				m.clearPendingDelete()
+				m.stopAllGraceful(context.Background())
+				break
+			}
+			if !m.anyStoppableProcess() {
+				m.appendToast(ToastErr, "Stop all: nothing running to stop")
+				break
+			}
+			m.clearPendingQuit()
+			m.clearPendingDelete()
+			m.clearPendingStop()
+			m.pendingStopAll = true
+			m.pendingStopAllDeadline = time.Now().Add(pendingConfirmWindow)
+		case "t":
+			if m.overlay == overlayHelp {
+				break
+			}
+			if m.overlay == overlayInspector {
+				m.overlay = overlayNone
+			}
+			if m.overlay == overlayAddProcess || m.overlay == overlayEditProcess || m.overlay == overlayLogFilter || m.overlay == overlayKillSignal {
+				break
+			}
+			if m.sup == nil {
 				break
 			}
 			id := m.currentID()
 			if id == "" {
+				m.appendToast(ToastErr, "Stop: no process selected")
 				break
 			}
-			st, ok := m.store.Get(id)
-			if ok && (st == core.StateRunning || st == core.StateStarting || st == core.StatePaused || st == core.StateStopping) {
-				m.appendLogLine("[error] edit: stop the process first")
-				break
-			}
-			ctx := context.Background()
-			specs, err := m.sup.List(ctx)
-			if err != nil {
-				m.appendLogLine(fmt.Sprintf("[error] edit: %v", err))
-				break
-			}
-			var spec *core.ProcessSpec
-			for i := range specs {
-				if specs[i].ID == id {
-					spec = &specs[i]
-					break
+			if m.pendingStop {
+				if time.Now().After(m.pendingStopDeadline) || m.pendingStopID != id {
+					m.clearPendingStop()
 				}
 			}
-			if spec == nil {
-				m.appendLogLine("[error] edit: process not found")
+			if m.pendingStop && m.pendingStopID == id && time.Now().Before(m.pendingStopDeadline) {
+				m.clearPendingStop()
+				m.clearPendingStopAll()
+				m.clearPendingQuit()
+				m.clearPendingDelete()
+				ctx := context.Background()
+				m.appendCtlErr("stop", m.sup.Stop(ctx, id))
 				break
 			}
-			m.editTargetID = id
-			m.editBuf = innerCommandForEdit(*spec)
-			m.editNameBuf = spec.Name
-			m.lineOverlayField = lineFormNameField
-			m.overlay = overlayEditProcess
+			if !m.stopArmEligible(id) {
+				m.appendToast(ToastErr, "Stop: nothing to stop in this state")
+				break
+			}
+			m.clearPendingQuit()
+			m.clearPendingDelete()
+			m.clearPendingStopAll()
+			m.pendingStop = true
+			m.pendingStopDeadline = time.Now().Add(pendingConfirmWindow)
+			m.pendingStopID = id
 		case "enter":
 			if m.overlay == overlayHelp {
 				break
@@ -1076,17 +1948,22 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.overlay = overlayNone
 				break
 			}
-			if m.currentID() != "" {
-				m.overlay = overlayInspector
-				m.refreshInspector()
+			if m.overlay == overlayAddProcess || m.overlay == overlayEditProcess || m.overlay == overlayLogFilter || m.overlay == overlayKillSignal {
+				break
+			}
+			if cmd := m.openEditProcessFromMain(); cmd != nil {
+				return m, cmd
 			}
 		case "i":
 			if m.overlay == overlayHelp {
 				break
 			}
+			if m.overlay == overlayAddProcess || m.overlay == overlayEditProcess || m.overlay == overlayLogFilter || m.overlay == overlayKillSignal {
+				break
+			}
 			if m.overlay == overlayInspector {
 				m.overlay = overlayNone
-			} else {
+			} else if m.currentID() != "" {
 				m.overlay = overlayInspector
 				m.refreshInspector()
 			}
@@ -1094,32 +1971,57 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.overlay == overlayInspector {
 				m.refreshInspector()
 			}
-		case "up":
-			if m.overlay == overlayHelp {
-				break
-			}
-			if m.selected > 0 {
-				m.selected--
-				m.clampDockScroll(m.dockVisibleCount())
-			}
 		case "k":
 			if m.overlay == overlayHelp {
 				break
 			}
-			if m.sup != nil {
-				ctx := context.Background()
-				if id := m.currentID(); id != "" {
-					m.appendCtlErr("kill", m.sup.Kill(ctx, id))
-				}
+			if m.overlay == overlayInspector {
+				m.overlay = overlayNone
 			}
-		case "down":
+			if m.overlay == overlayAddProcess || m.overlay == overlayEditProcess || m.overlay == overlayLogFilter || m.overlay == overlayKillSignal {
+				break
+			}
+			if m.sup == nil {
+				break
+			}
+			id := m.currentID()
+			if id == "" {
+				m.appendToast(ToastErr, "Signal: no process selected")
+				break
+			}
+			m.clearPendingQuit()
+			m.clearPendingDelete()
+			m.clearPendingStop()
+			m.clearPendingStopAll()
+			m.killSignalBulkAll = false
+			m.killSignalTargetID = id
+			m.killSignalSel = 0
+			m.overlay = overlayKillSignal
+		case "K":
 			if m.overlay == overlayHelp {
 				break
 			}
-			if m.selected < len(m.processes)-1 {
-				m.selected++
-				m.clampDockScroll(m.dockVisibleCount())
+			if m.overlay == overlayInspector {
+				m.overlay = overlayNone
 			}
+			if m.overlay == overlayAddProcess || m.overlay == overlayEditProcess || m.overlay == overlayLogFilter || m.overlay == overlayKillSignal {
+				break
+			}
+			if m.sup == nil {
+				break
+			}
+			if !m.anyKillableProcess() {
+				m.appendToast(ToastErr, "Signal: nothing running to target")
+				break
+			}
+			m.clearPendingQuit()
+			m.clearPendingDelete()
+			m.clearPendingStop()
+			m.clearPendingStopAll()
+			m.killSignalBulkAll = true
+			m.killSignalTargetID = ""
+			m.killSignalSel = 0
+			m.overlay = overlayKillSignal
 		case ",", "<":
 			if m.overlay == overlayHelp {
 				break
@@ -1140,22 +2042,33 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.overlay == overlayHelp {
 				break
 			}
-			if m.sup != nil {
-				ctx := context.Background()
-				id := m.currentID()
-				if id == "" {
-					break
-				}
-				switch msg.String() {
-				case "s":
+			if m.sup == nil {
+				break
+			}
+			ctx := context.Background()
+			switch msg.String() {
+			case "S":
+				m.startAllGraceful(ctx)
+			case "Z":
+				m.pauseAllGraceful(ctx)
+			case "V":
+				m.continueAllGraceful(ctx)
+			case "Y":
+				m.restartAllGraceful(ctx)
+			case "s":
+				if id := m.currentID(); id != "" {
 					m.appendCtlErr("start", m.sup.Start(ctx, id))
-				case "t":
-					m.appendCtlErr("stop", m.sup.Stop(ctx, id))
-				case "z":
+				}
+			case "z":
+				if id := m.currentID(); id != "" {
 					m.appendCtlErr("pause", m.sup.Pause(ctx, id))
-				case "v":
+				}
+			case "v":
+				if id := m.currentID(); id != "" {
 					m.appendCtlErr("continue", m.sup.Continue(ctx, id))
-				case "y":
+				}
+			case "y":
+				if id := m.currentID(); id != "" {
 					m.appendCtlErr("restart", m.sup.Restart(ctx, id))
 				}
 			}
@@ -1167,7 +2080,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *model) View() string {
 	if m.width < 40 || m.height < 8 {
-		return "Terminal too small for imux TUI (need at least 40x8). Press q to quit."
+		return "Terminal too small (min 40×8). Press q again to quit."
 	}
 
 	logH, dockRows := m.layoutHeights()
@@ -1186,41 +2099,69 @@ func (m *model) View() string {
 	}
 
 	footer := m.renderFooter()
-	footerStyled := lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render(footer)
-	return lipgloss.JoinVertical(lipgloss.Left, logBlock, footerStyled)
+	return lipgloss.JoinVertical(lipgloss.Left, logBlock, footer)
 }
 
 func (m *model) renderFooter() string {
-	var s string
+	w := m.width
+	if w < 1 {
+		w = 1
+	}
+	var parts []string
+	var trail string
 	switch m.overlay {
 	case overlayHelp:
 		if m.helpReturnTo == overlayNone {
-			s = "Esc or ? closes help"
+			parts = []string{"Esc ? close"}
 		} else {
-			s = "Esc or ? returns"
+			parts = []string{"Esc ? return"}
 		}
 	case overlayInspector:
-		s = "Esc or Enter closes · r refresh"
+		parts = []string{"Esc or Enter closes", "r refresh"}
 	case overlayAddProcess:
-		s = "Esc cancels · Enter adds"
+		parts = []string{"Esc cancels", "Tab field", "Enter registers · s starts"}
 	case overlayEditProcess:
-		s = "Esc cancels · Enter saves · s starts"
+		parts = []string{"Esc cancels", "Tab field", "Enter saves · s starts"}
 	case overlayLogFilter:
-		s = "Esc cancel · Enter apply · Tab glob/regex"
+		parts = []string{"Esc or Ctrl+c cancels", "Enter apply"}
+	case overlayKillSignal:
+		parts = []string{"↑↓ choose signal", "Enter send", "Esc cancels"}
 	default:
-		ss, se, tt := "on", "on", "off"
-		if !m.showStdout {
-			ss = "off"
+		if m.pendingQuit || m.pendingDelete || m.pendingStop || m.pendingStopAll {
+			if m.pendingQuit {
+				parts = append(parts, "Press q or Ctrl+c again to quit")
+			}
+			if m.pendingDelete {
+				parts = append(parts, "Press d again to confirm delete")
+			}
+			if m.pendingStop {
+				parts = append(parts, "Press t to confirm stop")
+			}
+			if m.pendingStopAll {
+				parts = append(parts, "Press T to confirm stop all")
+			}
+			s := joinFooterImportantTrail(parts, "", w)
+			return StyleFooterPending(padRight(truncate(s, w), w))
 		}
-		if !m.showStderr {
-			se = "off"
+		if !m.toastDeadline.IsZero() && time.Now().Before(m.toastDeadline) && m.toastText != "" {
+			s := joinFooterImportantTrail([]string{m.toastText}, "", w)
+			return StyleFooterToast(padRight(truncate(s, w), w), m.toastKind)
 		}
-		if m.showTime {
-			tt = "on"
-		}
-		s = fmt.Sprintf("? help · q quit · O/E/@ out=%s err=%s time=%s · / filter · g tail · PgUp/PgDn", ss, se, tt)
+		trail = "? help"
+		parts = append(parts,
+			"q quit",
+			"n new",
+			"s start",
+			"t stop",
+			"k signal",
+			"d delete",
+			"i inspect",
+			"/ filter",
+			"Tab dock",
+		)
 	}
-	return padRight(truncate(s, m.width), m.width)
+	s := joinFooterImportantTrail(parts, trail, w)
+	return StyleFooterMuted(padRight(truncate(s, w), w))
 }
 
 func (m *model) renderBody(bodyH int) string {
@@ -1234,138 +2175,334 @@ func (m *model) renderBody(bodyH int) string {
 	}
 
 	lines := m.composeLines(h)
+	m.clampLogHScroll(lines, w)
 	for i := range lines {
-		lines[i] = padRight(truncate(lines[i], w), w)
+		lines[i] = padToCellWidth(ansi.Cut(lines[i], m.logHScroll, m.logHScroll+w), w)
 	}
 
 	return strings.Join(lines, "\n")
 }
 
+// dockIDStrings returns all slot IDs in stable order (including tombstones) for log colors.
+func (m *model) dockIDStrings() []string {
+	if len(m.slots) == 0 {
+		return nil
+	}
+	out := make([]string, len(m.slots))
+	for i := range m.slots {
+		out[i] = string(m.slots[i].ID)
+	}
+	return out
+}
+
+// clampLogScroll keeps scroll offset within matched lines so we never index past
+// the log (BuildWindowLinesFromIndices would otherwise show empty "past end" rows).
+func (m *model) clampLogScroll() {
+	n := len(m.matchedIdx)
+	if n == 0 {
+		m.logScroll = 0
+		return
+	}
+	maxSB := n - 1
+	if m.logScroll > maxSB {
+		m.logScroll = maxSB
+	}
+	if m.logScroll < 0 {
+		m.logScroll = 0
+	}
+}
+
+// clampLogHScroll keeps horizontal pan within the widest visible log line.
+func (m *model) clampLogHScroll(lines []string, viewW int) {
+	if viewW < 1 {
+		m.logHScroll = 0
+		return
+	}
+	maxW := 0
+	for _, ln := range lines {
+		if sw := ansi.StringWidth(ln); sw > maxW {
+			maxW = sw
+		}
+	}
+	maxPan := maxW - viewW
+	if maxPan < 0 {
+		maxPan = 0
+	}
+	if m.logHScroll > maxPan {
+		m.logHScroll = maxPan
+	}
+	if m.logHScroll < 0 {
+		m.logHScroll = 0
+	}
+}
+
 func (m *model) composeLines(n int) []string {
 	if err := m.syncLogIndices(); err != nil {
-		return []string{lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Render("log: ") + err.Error()}
+		return neutralPlaceholders(n)
 	}
-	lines, err := BuildWindowLinesFromIndices(m.slog, m.matchedIdx, m.logScroll, n, m.showTime)
+	m.clampLogScroll()
+	nameCol := dockNameColumnWidth(m.processes, 4, 32)
+	lines, err := BuildWindowLinesFromIndices(m.slog, m.matchedIdx, m.logScroll, n, m.logTimePrec, m.dockIDStrings(), nameCol)
 	if err != nil {
-		return []string{"log: " + err.Error()}
+		return neutralPlaceholders(n)
 	}
 	return lines
 }
 
+// helpOverlayContent builds the help modal when m.overlay == overlayHelp; which
+// sheet to show depends on helpReturnTo (the overlay ? was pressed from).
+func (m *model) helpOverlayContent() (title string, bodyLines []string) {
+	switch m.helpReturnTo {
+	case overlayInspector:
+		title = "Inspector help"
+		bodyLines = []string{
+			"Live metrics for the selected dock process (not a separate log view).",
+			"PID, recent CPU sample, RSS, threads, open file descriptors, command line.",
+			"",
+			"  r           refresh snapshot",
+			"  Esc Enter   close inspector",
+			"  ? Esc       close this help",
+			"",
+			"Session-wide keys (dock, log, process controls): close inspector first, then ? on the main view.",
+		}
+	case overlayKillSignal:
+		title = "Send signal help"
+		bodyLines = []string{
+			"Pick how to end or interrupt processes. k targets the selected slot; K targets every running slot.",
+			"Graceful stop matches a full Stop (SIGTERM, wait, then SIGKILL if needed on unix).",
+			"Other POSIX signals are sent to the process group; USR1/USR2/WINCH usually leave the child running (see meta lines in the log).",
+			"",
+			"  ↑ ↓         move highlight",
+			"  Enter       send the highlighted choice",
+			"  Esc Ctrl+c  close without sending",
+			"  ? Esc       close this help",
+			"",
+			"Other imux shortcuts: close this overlay, then ? on the main view.",
+		}
+	case overlayLogFilter:
+		title = "Log filter help"
+		bodyLines = []string{
+			"Restricts which merged log lines match (Go regexp). Empty clears the filter.",
+			"",
+			"  Enter       apply and close  ·  Esc Ctrl+c cancel",
+			"  ? Esc       close this help",
+			"  ←→ Home/End move in the pattern field",
+			"",
+			"Other imux shortcuts: close this overlay, then ? on the main view.",
+		}
+	case overlayAddProcess:
+		title = "New process help"
+		bodyLines = []string{
+			"Adds a dock slot wrapped like imux run (sh -c … or cmd /C … on Windows).",
+			"",
+			"  Tab         move between name and command fields",
+			"  Enter       register (still stopped; press s on the dock to run)",
+			"  Esc Ctrl+c  discard and close",
+			"  ? Esc       close this help",
+			"",
+			"Display names must be unique across slots (case-insensitive).",
+		}
+	case overlayEditProcess:
+		title = "Edit process help"
+		bodyLines = []string{
+			"Change display name and shell command for this slot.",
+			"If the process is running, Enter stops it for you, then saves (same as replace-then-save).",
+			"",
+			"  Tab         move between name and command fields",
+			"  Enter       save (press s on the dock when you want it running again)",
+			"  Esc Ctrl+c  discard and close",
+			"  ? Esc       close this help",
+			"",
+			"Display names must be unique across slots (case-insensitive).",
+		}
+	default:
+		title = "Help"
+		proc := strings.TrimSpace(m.currentName())
+		id := string(m.currentID())
+		var focusLine string
+		switch {
+		case proc != "" && id != "" && !strings.EqualFold(proc, id):
+			focusLine = fmt.Sprintf("Focus: %s (%s)", proc, id)
+		case proc != "":
+			focusLine = "Focus: " + proc
+		case id != "":
+			focusLine = "Focus: " + id
+		default:
+			focusLine = "Focus: —"
+		}
+		bodyLines = []string{
+			"One merged log for all processes (dock selection does not swap the log).",
+			"Log lines are stored on disk (unlinked temp); use imux --tee for a persisted copy.",
+			"",
+			"Keys:",
+			"From this sheet (main view): any other key runs that shortcut and closes help.",
+			"  Tab Shift+Tab move selection in the bottom dock (also Shift+↑↓ or , .)",
+			"  1-9           jump to process slot (first nine)",
+			"  s t z v y     start / stop / pause / continue / restart (selected)",
+			"  k             signal menu for selected slot, then Enter",
+			"  K             same menu for every running process, then Enter",
+			"  S T Z V Y     bulk start / stop all / pause / continue / restart",
+			"  , or .        previous / next process (same as Tab / Shift+Tab)",
+			"  n             new",
+			"  i             inspector (Esc or Enter closes, r refreshes)",
+			"  Enter         edit name + command for the selected slot",
+			"  d             delete slot (twice to confirm; slot must be stopped)",
+			"  o e           toggle stdout / stderr in the log view",
+			"  p P           log time precision: p next, P prev (off → s → ms → us)",
+			"  /             edit log filter (regular expression)",
+			"  ? Esc         help · close overlay",
+			"  q Ctrl+c      quit (press twice to confirm; stops children)",
+			"",
+			focusLine,
+		}
+	}
+	return title, bodyLines
+}
+
+// wrapModalLines word-wraps each logical line to w terminal cells and flattens
+// the result (empty strings preserved as paragraph breaks).
+func wrapModalLines(lines []string, w int) []string {
+	if w < 4 {
+		w = 4
+	}
+	var out []string
+	for _, ln := range lines {
+		if ln == "" {
+			out = append(out, "")
+			continue
+		}
+		wrapped := ansi.Wrap(ln, w, "")
+		for _, seg := range strings.Split(wrapped, "\n") {
+			out = append(out, seg)
+		}
+	}
+	return out
+}
+
 func (m *model) renderModal() string {
 	maxW := min(56, m.width-6)
-	maxH := min(16, m.height-6)
 	if m.overlay == overlayHelp {
 		maxW = min(72, m.width-4)
-		maxH = min(22, m.height-4)
 	}
 	if m.overlay == overlayInspector {
 		maxW = min(72, m.width-4)
-		maxH = min(22, m.height-4)
 	}
 	if m.overlay == overlayAddProcess || m.overlay == overlayEditProcess {
 		maxW = min(72, m.width-4)
-		maxH = min(16, m.height-4)
 	}
 	if m.overlay == overlayLogFilter {
 		maxW = min(72, m.width-4)
-		maxH = min(10, m.height-4)
+	}
+	if m.overlay == overlayKillSignal {
+		maxW = min(72, m.width-4)
 	}
 	if maxW < 24 {
 		maxW = 24
 	}
-	if maxH < 7 {
-		maxH = 7
-	}
 
 	innerW := maxW - 2
-	innerLines := maxH - 2
 	if innerW < 4 {
 		innerW = 4
-	}
-	if innerLines < 3 {
-		innerLines = 3
 	}
 
 	var title string
 	var bodyLines []string
 	switch m.overlay {
 	case overlayHelp:
-		title = "Help"
-		proc := m.currentName()
-		bodyLines = []string{
-			"One merged log for all processes (dock selection does not swap the log).",
-			"Log lines are stored on disk (unlinked temp); use imux tui --tee for a persisted copy.",
-			"",
-			"Keys:",
-			"  ↑ ↓           move selection in the bottom dock",
-			"  1-9           jump to process slot (first nine)",
-			"  s t k z v y   start / stop / kill / pause / continue / restart",
-			"  , or .        previous / next process (same as arrows)",
-			"  Enter or i    inspector (Esc or Enter closes, r refreshes)",
-			"  n             new process (name + command, Tab switches field)",
-			"  e             edit name + command (stop first; Enter saves, then s to run)",
-			"  O E @         toggle stdout / stderr / timestamps in the log view",
-			"  PgUp PgDn     scroll log · mouse wheel over log · g jump to tail",
-			"  /             edit log filter (glob or regex; Tab toggles mode)",
-			"  ? Esc         help · close overlay",
-			"  q Ctrl+c      quit (stops running demos)",
-			"",
-			fmt.Sprintf("Focus: %s (%s)", proc, m.currentID()),
-		}
+		title, bodyLines = m.helpOverlayContent()
 	case overlayInspector:
 		title = "Inspector"
-		bodyLines = append(append([]string(nil), m.inspectLines...), "", "Esc or Enter closes · r refresh · ? help")
+		bodyLines = append(append([]string(nil), m.inspectLines...), "", "Esc or Enter closes · r refresh · ? panel help")
 	case overlayAddProcess:
 		title = "New process"
-		bodyLines = append([]string{"Wrapped like imux run (sh -c or cmd /C)."},
-			lineFormModalBody(innerW, m.lineOverlayField, m.tick, m.addNameBuf, m.addBuf, "Esc cancel · Enter register+start")...)
+		bodyLines = appendModalSaveErr(
+			append([]string{"Wrapped like imux run (sh -c or cmd /C)."},
+				m.lineFormModalLines(m.lineFormInnerW(), false, "Esc cancels · Enter registers · Tab switches field · s starts")...),
+			innerW, m.modalErr)
 	case overlayEditProcess:
 		title = "Edit process"
-		bodyLines = append([]string{fmt.Sprintf("id %s — same slot.", m.editTargetID)},
-			lineFormModalBody(innerW, m.lineOverlayField, m.tick, m.editNameBuf, m.editBuf, "Esc cancel · Enter save (pending — s to start)")...)
+		bodyLines = appendModalSaveErr(
+			append([]string{fmt.Sprintf("id %s — same slot.", m.editTargetID)},
+				m.lineFormModalLines(m.lineFormInnerW(), true, "Esc cancels · Enter saves · Tab switches field · s starts when stopped")...),
+			innerW, m.modalErr)
 	case overlayLogFilter:
 		title = "Log filter"
-		mode := "glob"
-		if m.filterEditIsRx {
-			mode = "regex"
-		}
+		m.syncFilterInpWidth(innerW)
 		bodyLines = []string{
-			"Pattern (empty = no filter). Tab toggles glob vs regex.",
-			"Prefix optional on CLI: glob:… or re:…",
+			"Regular expression (Go syntax). Empty clears the filter.",
+			"CLI: --log-filter 're:…' or a bare pattern.",
 			"",
-			padRight(truncate("Mode: "+mode, innerW), innerW),
-			padRight(truncate("> "+m.filterEditBuf, innerW), innerW),
+			m.filterInp.View(),
 			"",
-			"Esc cancel · Enter apply · Tab mode",
+			"Esc or Ctrl+c cancel · Enter apply",
 		}
+	case overlayKillSignal:
+		if m.killSignalBulkAll {
+			title = "Signal → all running"
+		} else {
+			title = "Send signal"
+		}
+		id := m.killSignalTargetID
+		bodyLines = killSignalModalLines(m.killSignalSel, m.killSignalBulkAll, id, m.nameForID(id), m.killableRunningCount())
 	default:
 		title = ""
 		bodyLines = nil
 	}
 
-	bodyRows := innerLines - 1
-	if bodyRows < 1 {
-		bodyRows = 1
+	if title == "" && len(bodyLines) == 0 {
+		return ""
 	}
-	for len(bodyLines) < bodyRows {
+	if bodyLines == nil {
+		bodyLines = []string{}
+	}
+
+	bodyLines = wrapModalLines(bodyLines, innerW)
+
+	maxOuter := m.height - 4
+	if maxOuter < 7 {
+		maxOuter = 7
+	}
+	maxInner := maxOuter - 2
+	// Inner rows = title row + body (header is rendered separately below).
+	innerLines := min(maxInner, max(3, 1+len(bodyLines)))
+
+	formOverlay := m.overlay == overlayAddProcess || m.overlay == overlayEditProcess || m.overlay == overlayLogFilter || m.overlay == overlayKillSignal
+
+	bodyCapacity := innerLines - 1
+	if bodyCapacity < 1 {
+		bodyCapacity = 1
+	}
+	if len(bodyLines) > bodyCapacity {
+		if formOverlay {
+			// Never drop the bottom of a form: keep the tail (fields + footer + error) so edits are still visible.
+			if bodyCapacity <= 1 {
+				last := bodyLines[len(bodyLines)-1]
+				bodyLines = []string{padToCellWidth(ansi.Truncate(last, innerW, "…"), innerW)}
+			} else {
+				keep := bodyCapacity - 1
+				tail := bodyLines[len(bodyLines)-keep:]
+				warn := padToCellWidth("… top clipped — enlarge terminal or Esc", innerW)
+				bodyLines = append([]string{warn}, tail...)
+			}
+		} else {
+			bodyLines = bodyLines[:max(0, bodyCapacity-1)]
+			bodyLines = append(bodyLines, padToCellWidth("… (terminal too short — widen or close)", innerW))
+		}
+	}
+	for len(bodyLines) < bodyCapacity {
 		bodyLines = append(bodyLines, "")
 	}
-	if len(bodyLines) > bodyRows {
-		bodyLines = bodyLines[:bodyRows]
-	}
 	for i := range bodyLines {
-		bodyLines[i] = padRight(truncate(bodyLines[i], innerW), innerW)
+		bodyLines[i] = padToCellWidth(bodyLines[i], innerW)
 	}
 
-	header := padRight(truncate(" "+title+" ", innerW), innerW)
+	header := padToCellWidth(" "+title+" ", innerW)
 	all := append([]string{header}, bodyLines...)
 
+	// Modal: no fill color — use the terminal default background/foreground so it matches the rest of the UI.
 	style := lipgloss.NewStyle().
 		BorderStyle(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color("12")).
-		Background(lipgloss.Color("235")).
-		Foreground(lipgloss.Color("252")).
+		BorderForeground(lipgloss.Color("245")).
 		Width(innerW)
 
 	return style.Render(strings.Join(all, "\n"))
@@ -1375,17 +2512,13 @@ func truncate(s string, maxWidth int) string {
 	if maxWidth <= 0 {
 		return ""
 	}
-	if lipgloss.Width(s) <= maxWidth {
+	if ansi.StringWidth(s) <= maxWidth {
 		return s
 	}
 	if maxWidth == 1 {
 		return "…"
 	}
-	rs := []rune(s)
-	if len(rs) >= maxWidth {
-		return string(rs[:maxWidth-1]) + "…"
-	}
-	return s
+	return ansi.Truncate(s, maxWidth, "…")
 }
 
 func padRight(s string, width int) string {
@@ -1396,6 +2529,48 @@ func padRight(s string, width int) string {
 	return s + strings.Repeat(" ", width-visible)
 }
 
+// ttyProgramOpts returns extra tea options when stdin and/or stdout are not terminals
+// but the session still has a usable controlling terminal at /dev/tty.
+func ttyProgramOpts() (opts []tea.ProgramOption, cleanup func()) {
+	var tty *os.File
+	cleanup = func() {
+		if tty != nil {
+			_ = tty.Close()
+			tty = nil
+		}
+	}
+	if runtime.GOOS == "windows" {
+		return nil, cleanup
+	}
+	inTTY := xterm.IsTerminal(os.Stdin.Fd())
+	outTTY := xterm.IsTerminal(os.Stdout.Fd())
+	if inTTY && outTTY {
+		return nil, cleanup
+	}
+	var err error
+	tty, err = os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	if err != nil {
+		tty, err = os.Open("/dev/tty")
+	}
+	if err != nil || tty == nil || !xterm.IsTerminal(tty.Fd()) {
+		if tty != nil {
+			_ = tty.Close()
+			tty = nil
+		}
+		return nil, cleanup
+	}
+	if !inTTY && !outTTY {
+		return append(opts, tea.WithInput(tty), tea.WithOutput(tty)), cleanup
+	}
+	if !inTTY {
+		opts = append(opts, tea.WithInput(tty))
+	}
+	if !outTTY {
+		opts = append(opts, tea.WithOutput(tty))
+	}
+	return opts, cleanup
+}
+
 // Run launches the alt-screen Bubble Tea application.
 func Run(opts Options) error {
 	m, err := newModel(opts)
@@ -1403,7 +2578,15 @@ func Run(opts Options) error {
 		return err
 	}
 	defer m.dispose()
-	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
+
+	ttyOpts, cleanupTTY := ttyProgramOpts()
+	defer cleanupTTY()
+
+	base := []tea.ProgramOption{tea.WithAltScreen(), tea.WithMouseCellMotion()}
+	p := tea.NewProgram(m, append(base, ttyOpts...)...)
 	_, err = p.Run()
+	if err != nil && strings.Contains(err.Error(), "could not open a new TTY") {
+		return fmt.Errorf("%w\n\nThe TUI needs a real terminal (stdin/stdout on a TTY, or a working /dev/tty).", err)
+	}
 	return err
 }

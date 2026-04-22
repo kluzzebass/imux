@@ -3,6 +3,7 @@ package tui
 import (
 	"strings"
 
+	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 )
 
@@ -35,13 +36,19 @@ func compositeLogWithModal(base, modal string, width, height int) string {
 	overlayLines := strings.Split(modal, "\n")
 	ow := 0
 	for _, ln := range overlayLines {
-		if sw := ansi.StringWidth(ln); sw > ow {
+		if sw := lipgloss.Width(ln); sw > ow {
 			ow = sw
 		}
 	}
 	oh := len(overlayLines)
 	if ow == 0 || oh == 0 {
 		return strings.Join(baseLines, "\n")
+	}
+	// Every row must occupy the same cell width as the widest row. Otherwise
+	// startX is derived from max width but mergeLineAt used each row's own
+	// width, leaving a gap where the log showed through (jumbled with help).
+	for i := range overlayLines {
+		overlayLines[i] = padToCellWidth(overlayLines[i], ow)
 	}
 
 	startY := (height - oh) / 2
@@ -65,7 +72,10 @@ func compositeLogWithModal(base, modal string, width, height int) string {
 
 func mergeLineAt(baseLine, insert string, startCol, totalWidth int) string {
 	baseLine = padToCellWidth(baseLine, totalWidth)
-	ow := ansi.StringWidth(insert)
+	ow := lipgloss.Width(insert)
+	if ow == 0 {
+		ow = ansi.StringWidth(insert)
+	}
 	if startCol < 0 {
 		startCol = 0
 	}

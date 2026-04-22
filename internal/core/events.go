@@ -21,6 +21,11 @@ const (
 	EventProcessOutput EventType = "process_output"
 	// EventProcessRemoved means the process slot was dropped from the supervisor.
 	EventProcessRemoved EventType = "process_removed"
+	// EventProcessSpecUpdated means Command/Args/Name/etc. changed without a lifecycle transition.
+	EventProcessSpecUpdated EventType = "process_spec_updated"
+	// EventProcessSignalSent is a non-lifecycle POSIX signal delivered to the group (e.g. SIGUSR1).
+	// The process is usually left running; store state is unchanged.
+	EventProcessSignalSent EventType = "process_signal_sent"
 )
 
 // Event is emitted by supervisor components and consumed by UI/logging sinks.

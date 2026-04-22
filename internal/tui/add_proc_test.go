@@ -2,30 +2,13 @@ package tui
 
 import (
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"imux/internal/core"
 )
-
-func TestTrimLastRune(t *testing.T) {
-	t.Parallel()
-	if got := trimLastRune(""); got != "" {
-		t.Fatalf("empty: %q", got)
-	}
-	if got := trimLastRune("a"); got != "" {
-		t.Fatalf("one ascii: %q", got)
-	}
-	if got := trimLastRune("ab"); got != "a" {
-		t.Fatalf("ascii: %q", got)
-	}
-	if got := trimLastRune("é"); got != "" {
-		t.Fatalf("one rune: %q", got)
-	}
-	if got := trimLastRune("aé"); got != "a" {
-		t.Fatalf("ascii+rune: %q", got)
-	}
-}
 
 func TestNameFromCommandLine(t *testing.T) {
 	t.Parallel()
@@ -63,12 +46,74 @@ func TestInnerCommandForEditNonWrap(t *testing.T) {
 	}
 }
 
-func TestPrefixedInputLineCaretWidth(t *testing.T) {
+func TestNameLineTIViewWidth(t *testing.T) {
 	t.Parallel()
 	const innerW = 40
-	line := prefixedInputLine("> Name: ", "foo", innerW, true, 0)
-	if lipgloss.Width(line) > innerW {
-		t.Fatalf("line wider than innerW: %d > %d", lipgloss.Width(line), innerW)
+	ti := newNameLineTI()
+	ti.Width = lineFormTextWidth(innerW, ti)
+	ti.SetValue("foo")
+	// textinput may render the blinking cursor one cell past Width in some versions.
+	if w := lipgloss.Width(ti.View()); w > innerW+2 {
+		t.Fatalf("line much wider than innerW: %d > %d+2", w, innerW)
+	}
+}
+
+func TestPadLogNamePlain(t *testing.T) {
+	t.Parallel()
+	if got := padLogNamePlain("ps2", 6); got != "   ps2" || lipgloss.Width(got) != 6 {
+		t.Fatalf("left pad / right align: %q width %d", got, lipgloss.Width(got))
+	}
+	if got := padLogNamePlain("  ", 4); got != "   ?" || lipgloss.Width(got) != 4 {
+		t.Fatalf("empty-ish: %q w=%d", got, lipgloss.Width(got))
+	}
+}
+
+func TestDockNameColumnWidth(t *testing.T) {
+	t.Parallel()
+	if w := dockNameColumnWidth([]string{"a", "bcdef"}, 4, 32); w != 5 {
+		t.Fatalf("want 5 got %d", w)
+	}
+	if w := dockNameColumnWidth([]string{"verylongnamefortestinghere"}, 4, 8); w != 8 {
+		t.Fatalf("clamp max: got %d", w)
+	}
+}
+
+func TestWrapModalLinesWidth(t *testing.T) {
+	t.Parallel()
+	const w = 40
+	long := strings.Repeat("abcd ", 30)
+	out := wrapModalLines([]string{long}, w)
+	for _, ln := range out {
+		if sw := ansi.StringWidth(ln); sw > w {
+			t.Fatalf("line wider than %d: %d %q", w, sw, ln)
+		}
+	}
+}
+
+func TestExitCodeFromBusMessage(t *testing.T) {
+	t.Parallel()
+	if n, ok := exitCodeFromBusMessage("exited with code 0"); !ok || n != 0 {
+		t.Fatalf("zero: ok=%v n=%d", ok, n)
+	}
+	if n, ok := exitCodeFromBusMessage("exited with code 17"); !ok || n != 17 {
+		t.Fatalf("17: ok=%v n=%d", ok, n)
+	}
+	if _, ok := exitCodeFromBusMessage("exited with code "); ok {
+		t.Fatal("empty after prefix should fail")
+	}
+	if _, ok := exitCodeFromBusMessage("failed during start: x"); ok {
+		t.Fatal("start failure should not parse")
+	}
+}
+
+func TestFilterPatternTIViewWidth(t *testing.T) {
+	t.Parallel()
+	const innerW = 40
+	ti := newFilterPatternTI()
+	ti.Width = lineFormTextWidth(innerW, ti)
+	ti.SetValue(strings.Repeat("x", 200))
+	if w := lipgloss.Width(ti.View()); w > innerW+2 {
+		t.Fatalf("filter row much wider than innerW: %d > %d+2", w, innerW)
 	}
 }
 

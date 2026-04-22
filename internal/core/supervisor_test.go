@@ -134,6 +134,13 @@ func TestApplyLifecycleEvent(t *testing.T) {
 			want:    StateStopping,
 			ok:      true,
 		},
+		{
+			name:    "spec updated is not a lifecycle transition",
+			current: StateExited,
+			event:   EventProcessSpecUpdated,
+			want:    StateExited,
+			ok:      false,
+		},
 	}
 
 	for _, tc := range tests {

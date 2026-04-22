@@ -128,12 +128,6 @@ func (s *SessionLog) Append(rec Record) error {
 	if err := binary.Write(s.off, binary.LittleEndian, pos); err != nil {
 		return err
 	}
-	if err := s.data.Sync(); err != nil {
-		return err
-	}
-	if err := s.off.Sync(); err != nil {
-		return err
-	}
 
 	if s.tee != nil {
 		tag := string(rec.K)

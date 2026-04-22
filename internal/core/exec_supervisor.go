@@ -136,6 +136,34 @@ func (s *ExecSupervisor) Unregister(_ context.Context, id ProcessID) error {
 	return nil
 }
 
+// ReplaceSpec updates Name/Command/Args/Env/Dir/Restart for an existing slot when no OS
+// child is running. Lifecycle state in the store is unchanged.
+func (s *ExecSupervisor) ReplaceSpec(_ context.Context, id ProcessID, spec ProcessSpec) error {
+	if id == "" {
+		return fmt.Errorf("replace spec: process id is required")
+	}
+	if spec.Command == "" {
+		return fmt.Errorf("replace spec: command required for %q", id)
+	}
+	if spec.ID != "" && spec.ID != id {
+		return fmt.Errorf("replace spec: spec id %q must match %q or be empty", spec.ID, id)
+	}
+	spec.ID = id
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.procs[id]
+	if !ok {
+		return fmt.Errorf("replace spec: unknown process id %q", id)
+	}
+	if p.cmd != nil {
+		return fmt.Errorf("replace spec: process %q still has an active child; stop it and wait for exit first", id)
+	}
+	p.spec = spec
+	s.emit(id, EventProcessSpecUpdated, fmt.Sprintf("spec updated (%q)", spec.Name))
+	return nil
+}
+
 // CurrentPID returns the OS process id for id while the managed process is running
 // (including stop/kill in flight). If there is no live OS child, ok is false.
 func (s *ExecSupervisor) CurrentPID(id ProcessID) (pid int, ok bool) {

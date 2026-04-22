@@ -6,7 +6,7 @@ contract for follow-on MVP tasks.
 ## Goals
 
 - Support two execution surfaces:
-  - interactive TUI mode (`imux tui`)
+  - interactive TUI mode (default: `imux`, flags on the root command)
   - regular non-TUI CLI mode (`imux run ...`)
 - Keep process control independent from presentation so both surfaces share one
   backend lifecycle model.
@@ -17,8 +17,8 @@ contract for follow-on MVP tasks.
 
 ```mermaid
 flowchart TD
-  cli[CLI_Cobra] --> runMode[RunCommand_NonTUI]
-  cli --> tuiMode[TuiCommand_Interactive]
+  cli[Cobra_run_help] --> runMode[RunCommand_NonTUI]
+  pflag[Pflag_default_argv] --> tuiMode[TUI_main]
   runMode --> supervisor[Supervisor]
   tuiMode --> supervisor
   supervisor --> runtime[ExecRuntime]
@@ -31,8 +31,8 @@ flowchart TD
 ### Responsibilities
 
 - CLI (`internal/cli`):
-  - Parse commands and flags with Cobra.
-  - Choose mode (`run` vs `tui`).
+  - Default TUI argv is parsed with pflag (positional shell commands, `--name`, `--tee`, `--log-filter`).
+  - Cobra handles `run`, `help`, and shell completion only.
   - Translate CLI input into backend requests.
 - Supervisor (`internal/core`):
   - Own process registration/start/stop/restart decisions.
@@ -86,7 +86,7 @@ Additional restart rules:
 - Command/flag surface follows the ergonomics of `multirun` in `gastrolog`
   where practical (`--name`, `--grace`, `--no-fail-fast`, `--tee`).
 
-### TUI mode (`imux tui`)
+### TUI mode (default `imux`)
 
 - Initializes interactive renderer and keyboard/mouse command handling.
 - Shares the same supervisor/event/state contracts as non-TUI mode.

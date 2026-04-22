@@ -29,3 +29,7 @@ coverage.html
 # vscode/cursor
 .vscode/
 *.code-workspace
+
+# logs
+*.log
+logs/

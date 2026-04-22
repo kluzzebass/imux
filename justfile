@@ -1,13 +1,23 @@
 set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
+# Pass recipe arguments as real argv after the shell `-c` script (required for `"$@"`).
+set positional-arguments := true
 
 _default:
   @just --list
 
-# Run the app. Pass imux args directly: `just run tui`, `just run run --help`, etc.
-# Do not put `--` between `run` and the imux subcommand (`just run -- tui` passes a
-# literal `--` into imux and breaks Cobra subcommand parsing).
-run *args:
-  @go run . {{args}}
+# Run imux from source. The line is `go run .` — that is the **Go tool** (“compile and run
+# this package”), not the imux CLI subcommand `run`. Same argv as running `./bin/imux` after
+# `just build`.
+# Examples:
+#   just imux                                    → TUI only
+#   just imux --tee log.txt                     → TUI + tee
+#   just imux --name a,b 'ls' 'ps'              → TUI + two running commands (no "run" word)
+#   just imux run --name a,b 'ls' 'ps'          → non-TUI batch mode (merged stdout, then exit)
+# Do not put `--` before the first imux arg in a way that hides the real argv from the shell.
+# Linewise + positional-arguments: bash gets one argv per just argument after the recipe
+# name (quoted commands stay intact). The child keeps the same stdio as the `just` process.
+imux *args:
+  cd "{{ justfile_directory() }}" && exec go run . "$@"
 
 # Build local binary
 build:

@@ -6,35 +6,42 @@ import (
 	"strings"
 )
 
+// BootstrapProc is one shell command to register and start before the TUI first paints.
+type BootstrapProc struct {
+	ID   string // stable slot id (also the initial display name until edited)
+	Line string // full user command line (wrapped with sh -c / cmd /C)
+}
+
 // Options configures the TUI session (CLI flags).
 type Options struct {
 	TeePath   string
-	LogFilter string // optional: "glob:PAT" or "re:PAT"; bare string treated as glob
+	LogFilter string // optional: "re:PAT" or bare PAT (Go regexp); empty = no filter
+	Bootstrap []BootstrapProc
 }
 
-// ParseLogFilter returns (isRegex, pattern, err). Empty input means no filter.
-func ParseLogFilter(s string) (isRegex bool, pattern string, err error) {
+// ParseLogFilter returns the regexp pattern, or empty for no filter.
+// Accepts "re:PAT" or bare PAT (both must compile as Go regex).
+// Legacy "glob:…" is rejected.
+func ParseLogFilter(s string) (pattern string, err error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
-		return false, "", nil
+		return "", nil
+	}
+	if strings.HasPrefix(s, "glob:") {
+		return "", fmt.Errorf("log filter: glob mode was removed; use re:… or a bare regular expression")
 	}
 	if strings.HasPrefix(s, "re:") {
 		p := strings.TrimPrefix(s, "re:")
 		if p == "" {
-			return true, "", fmt.Errorf("log filter: empty pattern after re:")
+			return "", fmt.Errorf("log filter: empty pattern after re:")
 		}
 		if _, err := regexp.Compile(p); err != nil {
-			return true, "", fmt.Errorf("log filter regexp: %w", err)
+			return "", fmt.Errorf("log filter regexp: %w", err)
 		}
-		return true, p, nil
+		return p, nil
 	}
-	if strings.HasPrefix(s, "glob:") {
-		p := strings.TrimPrefix(s, "glob:")
-		if p == "" {
-			return false, "", fmt.Errorf("log filter: empty pattern after glob:")
-		}
-		return false, p, nil
+	if _, err := regexp.Compile(s); err != nil {
+		return "", fmt.Errorf("log filter regexp: %w", err)
 	}
-	// Default: glob
-	return false, s, nil
+	return s, nil
 }
