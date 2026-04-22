@@ -184,3 +184,65 @@ func TestExecSupervisorCurrentPIDWhileRunning(t *testing.T) {
 	}
 	_ = sup.Stop(ctx, id)
 }
+
+func TestExecSupervisorUnregisterPendingThenRegisterSameID(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("uses sh -c")
+	}
+	store := NewMapStateStore()
+	sup := NewExecSupervisor(NewChanEventBus(), store)
+	ctx := context.Background()
+	id := ProcessID("slot")
+	if err := sup.Register(ctx, ProcessSpec{
+		ID:      id,
+		Name:    "one",
+		Command: "sh",
+		Args:    []string{"-c", "true"},
+		Restart: RestartConfig{Policy: RestartNever},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sup.Unregister(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := store.Get(id); ok {
+		t.Fatal("expected process removed from store")
+	}
+	if err := sup.Register(ctx, ProcessSpec{
+		ID:      id,
+		Name:    "two",
+		Command: "sh",
+		Args:    []string{"-c", "true"},
+		Restart: RestartConfig{Policy: RestartNever},
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestExecSupervisorUnregisterRejectsRunning(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("uses sleep")
+	}
+	sup := NewExecSupervisor(NewChanEventBus(), NewMapStateStore())
+	ctx := context.Background()
+	id := ProcessID("run")
+	if err := sup.Register(ctx, ProcessSpec{
+		ID:      id,
+		Name:    "s",
+		Command: "sleep",
+		Args:    []string{"30"},
+		Restart: RestartConfig{Policy: RestartNever},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sup.Start(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(40 * time.Millisecond)
+	if err := sup.Unregister(ctx, id); err == nil {
+		t.Fatal("expected unregister error while running")
+	}
+	_ = sup.Stop(ctx, id)
+}

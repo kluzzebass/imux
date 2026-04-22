@@ -117,6 +117,25 @@ func (s *ExecSupervisor) List(_ context.Context) ([]ProcessSpec, error) {
 	return out, nil
 }
 
+// Unregister drops a process slot when it has no live child (pending / exited / failed).
+func (s *ExecSupervisor) Unregister(_ context.Context, id ProcessID) error {
+	s.mu.Lock()
+	p, ok := s.procs[id]
+	if !ok {
+		s.mu.Unlock()
+		return fmt.Errorf("unregister: unknown process id %q", id)
+	}
+	if p.cmd != nil {
+		s.mu.Unlock()
+		return fmt.Errorf("unregister: process %q still has an active child; stop it and wait for exit first", id)
+	}
+	delete(s.procs, id)
+	s.mu.Unlock()
+	s.store.Delete(id)
+	s.emit(id, EventProcessRemoved, "unregistered")
+	return nil
+}
+
 // CurrentPID returns the OS process id for id while the managed process is running
 // (including stop/kill in flight). If there is no live OS child, ok is false.
 func (s *ExecSupervisor) CurrentPID(id ProcessID) (pid int, ok bool) {

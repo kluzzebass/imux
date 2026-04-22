@@ -22,6 +22,7 @@ const (
 	overlayInspector
 	overlayHelp
 	overlayAddProcess
+	overlayEditProcess
 )
 
 type model struct {
@@ -46,8 +47,10 @@ type model struct {
 	inspectCPU     *inspect.CPUSample
 	inspectFocusID core.ProcessID
 
-	addBuf      string
-	nextUserSeq int
+	addBuf       string
+	nextUserSeq  int
+	editBuf      string
+	editTargetID core.ProcessID
 }
 
 type tickMsg time.Time
@@ -262,7 +265,7 @@ func newModel() *model {
 		dockCmd:   dock,
 		ids:       ids,
 		selected:  0,
-		events:    []string{"[o] (imux) merged log — n new process · dock: ↑↓ 1–9 · Enter inspector · s/t/k/z/v/y."},
+		events:    []string{"[o] (imux) merged log — n new · e edit (when stopped) · dock: ↑↓ 1–9 · Enter inspector · s/t/k/z/v/y."},
 	}
 }
 
@@ -407,6 +410,91 @@ func (m *model) tryAddProcess() {
 	m.appendLogLine("[error] add process: could not allocate id")
 }
 
+func (m *model) resetLineOverlay() {
+	m.addBuf = ""
+	m.editBuf = ""
+	m.editTargetID = ""
+	m.overlay = overlayNone
+}
+
+func (m *model) tryEditProcess() {
+	line := strings.TrimSpace(m.editBuf)
+	id := m.editTargetID
+	if id == "" {
+		m.resetLineOverlay()
+		return
+	}
+	if line == "" {
+		m.appendLogLine("[error] edit process: empty command")
+		return
+	}
+	if m.sup == nil {
+		m.appendLogLine("[error] edit process: no supervisor")
+		return
+	}
+	st, ok := m.store.Get(id)
+	if ok && (st == core.StateRunning || st == core.StateStarting || st == core.StatePaused || st == core.StateStopping) {
+		m.appendLogLine("[error] edit process: stop the process before editing the command")
+		return
+	}
+	ctx := context.Background()
+	specs, err := m.sup.List(ctx)
+	if err != nil {
+		m.appendLogLine(fmt.Sprintf("[error] edit process: list: %v", err))
+		return
+	}
+	var oldSpec core.ProcessSpec
+	var found bool
+	for _, sp := range specs {
+		if sp.ID == id {
+			oldSpec = sp
+			found = true
+			break
+		}
+	}
+	if !found {
+		m.appendLogLine("[error] edit process: process not found")
+		return
+	}
+	if err := m.sup.Unregister(ctx, id); err != nil {
+		m.appendLogLine(fmt.Sprintf("[error] edit process: unregister: %v", err))
+		return
+	}
+	sh, shellArgs := shellWrapUserCommand(line)
+	name := nameFromCommandLine(line)
+	spec := core.ProcessSpec{
+		ID:      id,
+		Name:    name,
+		Command: sh,
+		Args:    shellArgs,
+		Restart: core.RestartConfig{Policy: core.RestartNever},
+	}
+	if err := m.sup.Register(ctx, spec); err != nil {
+		m.appendLogLine(fmt.Sprintf("[error] edit process: register: %v", err))
+		if rerr := m.sup.Register(ctx, oldSpec); rerr != nil {
+			m.appendLogLine(fmt.Sprintf("[error] edit process: could not restore previous definition: %v", rerr))
+		} else {
+			m.appendLogLine("[ok] edit aborted; restored previous command")
+		}
+		m.refreshProcs()
+		m.resetLineOverlay()
+		return
+	}
+	if err := m.sup.Start(ctx, id); err != nil {
+		m.appendLogLine(fmt.Sprintf("[error] edit process %s: start failed (registered, use s): %v", id, err))
+	} else {
+		m.appendLogLine(fmt.Sprintf("[ok] updated process %s (%s)", id, name))
+	}
+	m.refreshProcs()
+	for i, pid := range m.ids {
+		if pid == id {
+			m.selected = i
+			break
+		}
+	}
+	m.resetLineOverlay()
+}
+
 func (m *model) refreshProcs() {
 	if m.sup == nil {
 		return
@@ -471,9 +559,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		m.clampDockScroll(m.dockVisibleCount())
 	case tea.KeyMsg:
-		if m.overlay == overlayAddProcess {
+		if m.overlay == overlayAddProcess || m.overlay == overlayEditProcess {
+			edit := m.overlay == overlayEditProcess
 			if msg.String() == "?" {
-				m.helpReturnTo = overlayAddProcess
+				m.helpReturnTo = m.overlay
 				m.overlay = overlayHelp
 				return m, nil
 			}
@@ -482,23 +571,45 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.shutdownProcs()
 				return m, tea.Quit
 			case "esc":
-				m.addBuf = ""
-				m.overlay = overlayNone
+				m.resetLineOverlay()
 			case "enter":
-				m.tryAddProcess()
+				if edit {
+					m.tryEditProcess()
+				} else {
+					m.tryAddProcess()
+				}
 			case "backspace":
-				m.addBuf = trimLastRune(m.addBuf)
+				if edit {
+					m.editBuf = trimLastRune(m.editBuf)
+				} else {
+					m.addBuf = trimLastRune(m.addBuf)
+				}
 			case "tab":
-				m.addBuf += "    "
+				if edit {
+					m.editBuf += "    "
+				} else {
+					m.addBuf += "    "
+				}
 			default:
 				switch msg.Type {
 				case tea.KeyRunes:
-					m.addBuf += string(msg.Runes)
-					if len(m.addBuf) > 4000 {
-						m.addBuf = m.addBuf[:4000]
+					if edit {
+						m.editBuf += string(msg.Runes)
+						if len(m.editBuf) > 4000 {
+							m.editBuf = m.editBuf[:4000]
+						}
+					} else {
+						m.addBuf += string(msg.Runes)
+						if len(m.addBuf) > 4000 {
+							m.addBuf = m.addBuf[:4000]
+						}
 					}
 				case tea.KeySpace:
-					m.addBuf += " "
+					if edit {
+						m.editBuf += " "
+					} else {
+						m.addBuf += " "
+					}
 				}
 			}
 			return m, nil
@@ -538,11 +649,37 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.overlay == overlayInspector {
 				m.overlay = overlayNone
 			}
-			if m.overlay == overlayAddProcess {
+			if m.overlay == overlayAddProcess || m.overlay == overlayEditProcess {
 				break
 			}
 			m.overlay = overlayAddProcess
 			m.addBuf = ""
+		case "e":
+			if m.overlay == overlayHelp {
+				break
+			}
+			if m.overlay == overlayInspector {
+				m.overlay = overlayNone
+			}
+			if m.overlay == overlayAddProcess || m.overlay == overlayEditProcess {
+				break
+			}
+			id := m.currentID()
+			if id == "" {
+				break
+			}
+			st, ok := m.store.Get(id)
+			if ok && (st == core.StateRunning || st == core.StateStarting || st == core.StatePaused || st == core.StateStopping) {
+				m.appendLogLine("[error] edit: stop the process first")
+				break
+			}
+			m.editTargetID = id
+			if m.selected >= 0 && m.selected < len(m.dockCmd) {
+				m.editBuf = m.dockCmd[m.selected]
+			} else {
+				m.editBuf = string(id)
+			}
+			m.overlay = overlayEditProcess
 		case "enter":
 			if m.overlay == overlayHelp {
 				break
@@ -678,6 +815,8 @@ func (m *model) renderFooter() string {
 		s = "Esc or Enter closes · r refresh"
 	case overlayAddProcess:
 		s = "Esc cancels · Enter adds"
+	case overlayEditProcess:
+		s = "Esc cancels · Enter saves"
 	default:
 		s = "? help · q quit"
 	}
@@ -755,7 +894,7 @@ func (m *model) renderModal() string {
 		maxW = min(72, m.width-4)
 		maxH = min(22, m.height-4)
 	}
-	if m.overlay == overlayAddProcess {
+	if m.overlay == overlayAddProcess || m.overlay == overlayEditProcess {
 		maxW = min(72, m.width-4)
 		maxH = min(12, m.height-4)
 	}
@@ -792,6 +931,7 @@ func (m *model) renderModal() string {
 			"  , or .        previous / next process (same as arrows)",
 			"  Enter or i    inspector (Esc or Enter closes, r refreshes)",
 			"  n             new process (shell command, Esc/Enter in form)",
+			"  e             edit command (process must be stopped)",
 			"  ? Esc         help · close overlay",
 			"  q Ctrl+c      quit (stops running demos)",
 			"",
@@ -817,6 +957,24 @@ func (m *model) renderModal() string {
 			prefix + prompt,
 			"",
 			"Esc cancel · Enter register+start",
+		}
+	case overlayEditProcess:
+		title = "Edit process"
+		prompt := m.editBuf
+		prefix := "$ "
+		budget := innerW - lipgloss.Width(prefix)
+		if budget < 4 {
+			budget = 4
+		}
+		if lipgloss.Width(prompt) > budget {
+			prompt = truncate(prompt, budget)
+		}
+		bodyLines = []string{
+			fmt.Sprintf("id %s — same slot, replaces command.", m.editTargetID),
+			"",
+			prefix + prompt,
+			"",
+			"Esc cancel · Enter save (re-register + start)",
 		}
 	default:
 		title = ""

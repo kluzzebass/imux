@@ -19,6 +19,8 @@ const (
 	EventProcessError EventType = "process_error"
 	// EventProcessOutput is one logical line from a child stream (stdout/stderr).
 	EventProcessOutput EventType = "process_output"
+	// EventProcessRemoved means the process slot was dropped from the supervisor.
+	EventProcessRemoved EventType = "process_removed"
 )
 
 // Event is emitted by supervisor components and consumed by UI/logging sinks.

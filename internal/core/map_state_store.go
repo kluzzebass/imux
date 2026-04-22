@@ -35,3 +35,9 @@ func (s *MapStateStore) Snapshot() Snapshot {
 	}
 	return Snapshot{Processes: out}
 }
+
+func (s *MapStateStore) Delete(id ProcessID) {
+	s.mu.Lock()
+	delete(s.m, id)
+	s.mu.Unlock()
+}

@@ -23,6 +23,8 @@ type StateStore interface {
 	Set(ProcessID, ProcessState)
 	Get(ProcessID) (ProcessState, bool)
 	Snapshot() Snapshot
+	// Delete removes id from the store if present (used when unregistering a slot).
+	Delete(ProcessID)
 }
 
 // ApplyLifecycleEvent advances a single process state from a lifecycle event.
