@@ -59,18 +59,24 @@ close-checklist:
   @echo "2) Ask user to test"
   @echo "3) Ask user for explicit close approval"
   @echo "4) Run: just close-issue <issueId> \"<reason>\" \"<commit-message>\" yes"
+  @echo "   If merge already landed on main outside the helper: just close-issue-on-main … (same steps 1–3)"
   @echo "5) Verify: dcat show <issueId> is closed; git status clean/on expected branch"
   @echo
   @echo "Non-negotiable:"
   @echo "- Do not skip or reorder steps"
   @echo "- Do not pause between close and commit/merge/push"
-  @echo "- Do not do unrelated work between steps 4-7"
+  @echo "- Do not do unrelated work during the close transaction"
 
 # Enforced close transaction helper (close + commit + merge + push)
 # Example:
 # just close-issue imux-21um "Done" "Close imux-21um: architecture scaffold complete" yes
 close-issue issue reason commit_message approved='yes':
   ./scripts/close-issue.sh --issue "{{issue}}" --reason "{{reason}}" --commit-message "{{commit_message}}" --approved "{{approved}}"
+
+# Close dcat state from main when git history was merged without close-issue (recovery).
+# Same CLAUDE.md approval rules; only use after explicit user approval.
+close-issue-on-main issue reason commit_message approved='yes':
+  ./scripts/close-issue.sh --issue "{{issue}}" --reason "{{reason}}" --commit-message "{{commit_message}}" --approved "{{approved}}" --already-merged yes
 
 # Clean build/test artifacts
 clean:

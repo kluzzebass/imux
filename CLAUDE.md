@@ -33,9 +33,17 @@ Execute these steps in this exact order:
 1. Ensure issue status is `in_review`
 2. Ask user to test
 3. Ask user for explicit close approval ("can I close this issue?")
-4. Run `just close-issue <issueId> "<reason>" "<commit-message>" yes` immediately after approval
+4. Run `just close-issue <issueId> "<reason>" "<commit-message>" yes` immediately after approval (from the issue branch)
 5. Do not run close steps manually if the helper exists
 6. Verify final state (`dcat show <issueId>` is `closed`, `git status` clean/on expected branch)
+
+#### Recovery: merge already on `main`
+
+If the work was merged into `main` without going through `just close-issue` (GitHub merge, squash, local mistake), the issue can stay `in_review` with no legal way to replay the default transaction. After the same explicit close approval (steps 1–3), run from **`main`**:
+
+`just close-issue-on-main <issueId> "<reason>" "<commit-message>" yes`
+
+That runs the helper in recovery mode: `dcat close`, commit tracker files, push — no `git merge`.
 
 #### Non-negotiable rules
 
@@ -49,6 +57,6 @@ Execute these steps in this exact order:
 #### Forbidden order examples
 
 - Wrong: `dcat close` -> stop -> later commit/merge/push
-- Wrong: commit/merge/push -> then `dcat close`
-- Wrong: direct `dcat close` instead of `just close-issue ...`
+- Wrong: commit/merge/push -> then `dcat close` (except the documented `close-issue-on-main` recovery path after approval)
+- Wrong: direct `dcat close` instead of `just close-issue ...` or `just close-issue-on-main ...`
 - Wrong: close without explicit user approval in this thread
