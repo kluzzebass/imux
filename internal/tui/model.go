@@ -1419,7 +1419,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.appendToast(ToastErr, "Clipboard: "+msg.err.Error())
 		} else {
-			m.appendToast(ToastOK, "Copied visible log (plain text)")
+			m.appendToast(ToastOK, "Copied log window (full lines, plain text)")
 		}
 		return m, nil
 	case tickMsg:
@@ -1839,7 +1839,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				break
 			}
 			logH, _ := m.layoutHeights()
-			return m, runCopyLogPlainCmd(m.plainLogViewportText(logH))
+			return m, runCopyLogPlainCmd(m.plainLogCopyText(logH))
 		case "P":
 			if m.overlay == overlayHelp {
 				break
@@ -2301,11 +2301,21 @@ func (m *model) renderBody(bodyH int) string {
 	return strings.Join(lines, "\n")
 }
 
-// plainLogViewportText is the visible log as plain text (ANSI stripped, trailing pad spaces trimmed).
-func (m *model) plainLogViewportText(bodyH int) string {
-	lines := m.logViewportStyledLines(bodyH)
+// plainLogCopyText returns plain text for the same matched-record window as the log
+// pane (scroll position and height), but each line is the full logical row from disk
+// (not horizontally cut or wrapped for display). ANSI is stripped.
+func (m *model) plainLogCopyText(bodyH int) string {
+	if err := m.syncLogIndices(); err != nil {
+		return ""
+	}
+	m.clampLogScroll()
+	nameCol := dockNameColumnWidth(m.processes, 4, 32)
+	lines, err := BuildWindowLinesFromIndices(m.slog, m.matchedIdx, m.logScroll, bodyH, m.logTimePrec, m.dockIDStrings(), nameCol)
+	if err != nil {
+		return ""
+	}
 	for i := range lines {
-		lines[i] = strings.TrimRight(ansi.Strip(lines[i]), " ")
+		lines[i] = strings.TrimSpace(ansi.Strip(lines[i]))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -2481,7 +2491,7 @@ func (m *model) helpOverlayContent() (title string, bodyLines []string) {
 			"  d             delete slot",
 			"  o e           toggle stdout / stderr",
 			"  w             toggle log word wrap",
-			"  c             copy visible log",
+			"  c             copy log window (full lines)",
 			"  p P           log time precision: p next, P prev (off → s → ms → us)",
 			"  /             edit log filter",
 			"  ? Esc         help · close overlay",
