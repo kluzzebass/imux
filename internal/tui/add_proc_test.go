@@ -82,11 +82,36 @@ func TestWrapModalLinesWidth(t *testing.T) {
 	t.Parallel()
 	const w = 40
 	long := strings.Repeat("abcd ", 30)
-	out := wrapModalLines([]string{long}, w)
+	out := wrapModalLines([]string{long}, w, false)
 	for _, ln := range out {
 		if sw := ansi.StringWidth(ln); sw > w {
 			t.Fatalf("line wider than %d: %d %q", w, sw, ln)
 		}
+	}
+}
+
+func TestWrapModalLinesMergeHelpProse(t *testing.T) {
+	t.Parallel()
+	const w = 120
+	lines := []string{
+		"Hello world.",
+		"Goodbye moon.",
+		"",
+		"Keys:",
+		"  a             b",
+	}
+	out := wrapModalLines(lines, w, true)
+	for _, ln := range out {
+		if ln == "" {
+			continue
+		}
+		if sw := ansi.StringWidth(ln); sw > w {
+			t.Fatalf("line wider than %d: %d %q", w, sw, ln)
+		}
+	}
+	joined := strings.Join(out, "\n")
+	if !strings.Contains(joined, "Hello world. Goodbye moon.") {
+		t.Fatalf("expected merged prose on one line at wide width; got:\n%s", joined)
 	}
 }
 

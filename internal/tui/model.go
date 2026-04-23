@@ -83,31 +83,32 @@ type model struct {
 	bus   core.EventBus
 	sub   <-chan core.Event
 
-	slog           *sessionlog.SessionLog
-	opts           Options
-	showStdout     bool
-	showStderr     bool
-	logTimePrec    logTimePrecision
-	logScroll      int
-	logHScroll     int // horizontal pan of log lines (terminal cells)
+	slog          *sessionlog.SessionLog
+	opts          Options
+	showStdout    bool
+	showStderr    bool
+	logTimePrec   logTimePrecision
+	logScroll     int
+	logHScroll    int  // horizontal pan of log lines (terminal cells)
+	logWordWrap   bool // when true, log lines wrap to the viewport width (no horizontal pan)
 	filt          *compiledFilter
 	filterPattern string
 	filterInp     textinput.Model
 	matchedIdx    []int64
-	lastBuiltN     int64
-	matchSig       string
+	lastBuiltN    int64
+	matchSig      string
 
 	inspectLines   []string
 	inspectCPU     *inspect.CPUSample
 	inspectFocusID core.ProcessID
 
-	nextUserSeq int
-	addNameInp  textinput.Model
-	addCmdInp   textinput.Model
-	editNameInp textinput.Model
-	editCmdInp  textinput.Model
-	editTargetID core.ProcessID
-	lineOverlayField int // lineFormNameField or lineFormCmdField
+	nextUserSeq      int
+	addNameInp       textinput.Model
+	addCmdInp        textinput.Model
+	editNameInp      textinput.Model
+	editCmdInp       textinput.Model
+	editTargetID     core.ProcessID
+	lineOverlayField int    // lineFormNameField or lineFormCmdField
 	modalErr         string // add/edit overlay: last save/register failure (footer toasts are hidden there)
 
 	// lastExitCode is set from supervisor bus messages for dock display after exit/fail.
@@ -447,18 +448,18 @@ func newModel(opts Options) (*model, error) {
 	sup.SetStopGrace(10 * time.Second)
 
 	m := &model{
-		sup:            sup,
-		store:          store,
-		bus:            bus,
-		sub:            bus.Subscribe(512),
-		processes:      nil,
-		dockCmd:        nil,
-		ids:            nil,
-		selected:       0,
-		slog:           slog,
-		opts:           opts,
-		showStdout:     true,
-		showStderr:     true,
+		sup:           sup,
+		store:         store,
+		bus:           bus,
+		sub:           bus.Subscribe(512),
+		processes:     nil,
+		dockCmd:       nil,
+		ids:           nil,
+		selected:      0,
+		slog:          slog,
+		opts:          opts,
+		showStdout:    true,
+		showStderr:    true,
 		filt:          cf,
 		filterPattern: pat,
 		lastBuiltN:    -1,
@@ -647,10 +648,11 @@ func (m *model) appendCtlErr(op string, err error) {
 	m.appendCtlErrFor(op, m.currentID(), m.currentName(), err)
 }
 
-func (m *model) startAllGraceful(ctx context.Context) {
+func (m *model) startAllGracefulCmd() tea.Cmd {
 	if m.sup == nil {
-		return
+		return nil
 	}
+	var cmds []tea.Cmd
 	for _, id := range m.ids {
 		st, ok := m.store.Get(id)
 		if !ok {
@@ -658,17 +660,28 @@ func (m *model) startAllGraceful(ctx context.Context) {
 		}
 		switch st {
 		case core.StatePending, core.StateExited, core.StateFailed:
-			m.appendCtlErrFor("start", id, m.nameForID(id), m.sup.Start(ctx, id))
+			id := id
+			name := m.nameForID(id)
+			sup := m.sup
+			cmds = append(cmds, func() tea.Msg {
+				err := sup.Start(context.Background(), id)
+				return supOpDoneMsg{op: "start", id: id, name: name, err: err}
+			})
 		default:
 			// running, starting, paused, stopping: skip
 		}
 	}
+	if len(cmds) == 0 {
+		return nil
+	}
+	return tea.Batch(cmds...)
 }
 
-func (m *model) stopAllGraceful(ctx context.Context) {
+func (m *model) stopAllGracefulCmd() tea.Cmd {
 	if m.sup == nil {
-		return
+		return nil
 	}
+	var cmds []tea.Cmd
 	for _, id := range m.ids {
 		st, ok := m.store.Get(id)
 		if !ok {
@@ -676,50 +689,93 @@ func (m *model) stopAllGraceful(ctx context.Context) {
 		}
 		switch st {
 		case core.StateRunning, core.StateStarting, core.StatePaused:
-			m.appendCtlErrFor("stop", id, m.nameForID(id), m.sup.Stop(ctx, id))
+			id := id
+			name := m.nameForID(id)
+			sup := m.sup
+			cmds = append(cmds, func() tea.Msg {
+				err := sup.Stop(context.Background(), id)
+				return supOpDoneMsg{op: "stop", id: id, name: name, err: err}
+			})
 		default:
 			// pending, exited, failed, stopping: skip
 		}
 	}
+	if len(cmds) == 0 {
+		return nil
+	}
+	return tea.Batch(cmds...)
 }
 
-func (m *model) pauseAllGraceful(ctx context.Context) {
+func (m *model) pauseAllGracefulCmd() tea.Cmd {
 	if m.sup == nil {
-		return
+		return nil
 	}
+	var cmds []tea.Cmd
 	for _, id := range m.ids {
 		st, ok := m.store.Get(id)
 		if !ok || st != core.StateRunning {
 			continue
 		}
-		m.appendCtlErrFor("pause", id, m.nameForID(id), m.sup.Pause(ctx, id))
+		id := id
+		name := m.nameForID(id)
+		sup := m.sup
+		cmds = append(cmds, func() tea.Msg {
+			err := sup.Pause(context.Background(), id)
+			return supOpDoneMsg{op: "pause", id: id, name: name, err: err}
+		})
 	}
+	if len(cmds) == 0 {
+		return nil
+	}
+	return tea.Batch(cmds...)
 }
 
-func (m *model) continueAllGraceful(ctx context.Context) {
+func (m *model) continueAllGracefulCmd() tea.Cmd {
 	if m.sup == nil {
-		return
+		return nil
 	}
+	var cmds []tea.Cmd
 	for _, id := range m.ids {
 		st, ok := m.store.Get(id)
 		if !ok || st != core.StatePaused {
 			continue
 		}
-		m.appendCtlErrFor("continue", id, m.nameForID(id), m.sup.Continue(ctx, id))
+		id := id
+		name := m.nameForID(id)
+		sup := m.sup
+		cmds = append(cmds, func() tea.Msg {
+			err := sup.Continue(context.Background(), id)
+			return supOpDoneMsg{op: "continue", id: id, name: name, err: err}
+		})
 	}
+	if len(cmds) == 0 {
+		return nil
+	}
+	return tea.Batch(cmds...)
 }
 
-func (m *model) restartAllGraceful(ctx context.Context) {
+func (m *model) restartAllGracefulCmd() tea.Cmd {
 	if m.sup == nil {
-		return
+		return nil
 	}
+	var cmds []tea.Cmd
 	for _, id := range m.ids {
 		st, ok := m.store.Get(id)
 		if !ok || st == core.StateStopping {
 			continue
 		}
-		m.appendCtlErrFor("restart", id, m.nameForID(id), m.sup.Restart(ctx, id))
+		id := id
+		name := m.nameForID(id)
+		sup := m.sup
+		cmds = append(cmds, func() tea.Msg {
+			err := sup.Restart(context.Background(), id)
+			return supOpDoneMsg{op: "restart", id: id, name: name, err: err}
+		})
 	}
+	if len(cmds) == 0 {
+		return nil
+	}
+	return tea.Batch(cmds...)
 }
 
 func (m *model) refreshInspector() {
@@ -1010,27 +1066,27 @@ func (m *model) openEditProcessFromMain() tea.Cmd {
 	return m.refocusLineFormCurrent()
 }
 
-func (m *model) tryEditProcess() {
+func (m *model) tryEditProcess() tea.Cmd {
 	m.modalErr = ""
 	line := strings.TrimSpace(m.editCmdInp.Value())
 	id := m.editTargetID
 	if id == "" {
 		m.resetLineOverlay()
-		return
+		return nil
 	}
 	if line == "" {
 		m.modalErr = "Edit: empty command"
-		return
+		return nil
 	}
 	if m.sup == nil {
 		m.modalErr = "Edit: no supervisor"
-		return
+		return nil
 	}
 	ctx := context.Background()
 	specs, err := m.sup.List(ctx)
 	if err != nil {
 		m.modalErr = fmt.Sprintf("Edit: list: %v", err)
-		return
+		return nil
 	}
 	var oldSpec core.ProcessSpec
 	var found bool
@@ -1043,7 +1099,7 @@ func (m *model) tryEditProcess() {
 	}
 	if !found {
 		m.modalErr = "Edit: process not found"
-		return
+		return nil
 	}
 	sh, shellArgs := shellWrapUserCommand(line)
 	name := sanitizeDisplayName(m.editNameInp.Value())
@@ -1054,7 +1110,7 @@ func (m *model) tryEditProcess() {
 		name = "proc"
 	}
 	if _, dup := displayNameConflicts(specs, id, name); dup {
-		return
+		return nil
 	}
 	spec := core.ProcessSpec{
 		ID:      id,
@@ -1065,27 +1121,16 @@ func (m *model) tryEditProcess() {
 		Dir:     oldSpec.Dir,
 		Restart: oldSpec.Restart,
 	}
-	stoppedToSave := false
 	err = m.sup.ReplaceSpec(ctx, id, spec)
 	if err != nil && strings.Contains(err.Error(), "still has an active child") {
-		if stopErr := m.sup.Stop(ctx, id); stopErr != nil {
-			m.modalErr = fmt.Sprintf("Edit: replace blocked while running; stop failed: %v", stopErr)
-			m.refreshProcs()
-			return
-		}
-		err = m.sup.ReplaceSpec(ctx, id, spec)
-		stoppedToSave = err == nil
+		return supStopThenReplaceSpecCmd(m.sup, id, name, spec)
 	}
 	if err != nil {
 		m.modalErr = modalSaveErrMessage(err)
 		m.refreshProcs()
-		return
+		return nil
 	}
-	if stoppedToSave {
-		m.appendToast(ToastOK, fmt.Sprintf("Stopped and saved %s (%s); press s to run when ready", id, name))
-	} else {
-		m.appendToast(ToastOK, fmt.Sprintf("Updated %s (%s); press s to run when ready", id, name))
-	}
+	m.appendToast(ToastOK, fmt.Sprintf("Updated %s (%s); press s to run when ready", id, name))
 	m.refreshProcs()
 	for i, pid := range m.ids {
 		if pid == id {
@@ -1094,6 +1139,32 @@ func (m *model) tryEditProcess() {
 		}
 	}
 	m.resetLineOverlay()
+	return nil
+}
+
+func (m *model) handleReplaceSaveDone(msg supReplaceSaveDoneMsg) (tea.Model, tea.Cmd) {
+	id := msg.id
+	name := msg.name
+	if msg.err != nil {
+		m.modalErr = fmt.Sprintf("Edit: replace blocked while running; stop failed: %v", msg.err)
+		m.refreshProcs()
+		return m, m.refocusLineFormCurrent()
+	}
+	if msg.replaceErr != nil {
+		m.modalErr = modalSaveErrMessage(msg.replaceErr)
+		m.refreshProcs()
+		return m, m.refocusLineFormCurrent()
+	}
+	m.appendToast(ToastOK, fmt.Sprintf("Stopped and saved %s (%s); press s to run when ready", id, name))
+	m.refreshProcs()
+	for i, pid := range m.ids {
+		if pid == id {
+			m.selected = i
+			break
+		}
+	}
+	m.resetLineOverlay()
+	return m, nil
 }
 
 func (m *model) refreshProcs() {
@@ -1222,19 +1293,20 @@ func (m *model) killableRunningCount() int {
 	return n
 }
 
-func (m *model) applyKillSignalChoice() {
+func (m *model) applyKillSignalChoice() tea.Cmd {
 	menu := killSignalMenu()
 	if len(menu) == 0 || m.killSignalSel < 0 || m.killSignalSel >= len(menu) {
 		m.closeKillSignalOverlay()
-		return
+		return nil
 	}
 	if m.sup == nil {
 		m.closeKillSignalOverlay()
-		return
+		return nil
 	}
 	choice := menu[m.killSignalSel].sig
-	ctx := context.Background()
 	if m.killSignalBulkAll {
+		m.closeKillSignalOverlay()
+		var cmds []tea.Cmd
 		for _, id := range m.ids {
 			st, ok := m.store.Get(id)
 			if !ok {
@@ -1242,21 +1314,28 @@ func (m *model) applyKillSignalChoice() {
 			}
 			switch st {
 			case core.StateRunning, core.StateStarting, core.StatePaused:
-				m.appendCtlErrFor("signal", id, m.nameForID(id), m.sup.SendUserSignal(ctx, id, choice))
+				id := id
+				name := m.nameForID(id)
+				sup := m.sup
+				ch := choice
+				cmds = append(cmds, func() tea.Msg {
+					err := sup.SendUserSignal(context.Background(), id, ch)
+					return supOpDoneMsg{op: "signal", id: id, name: name, err: err}
+				})
 			}
 		}
-		m.closeKillSignalOverlay()
-		m.refreshProcs()
-		return
+		if len(cmds) == 0 {
+			return nil
+		}
+		return tea.Batch(cmds...)
 	}
 	id := m.killSignalTargetID
 	if id == "" {
 		m.closeKillSignalOverlay()
-		return
+		return nil
 	}
-	m.appendCtlErrFor("signal", id, m.nameForID(id), m.sup.SendUserSignal(ctx, id, choice))
 	m.closeKillSignalOverlay()
-	m.refreshProcs()
+	return supSignalCmd(m.sup, id, m.nameForID(id), choice)
 }
 
 // stopArmEligible is true when Stop is meaningful for this process (matches bulk stop rules).
@@ -1300,20 +1379,21 @@ func (m *model) anyKillableProcess() bool {
 	return false
 }
 
-func (m *model) shutdownProcs() {
+func (m *model) shutdownGracefulCmd() tea.Cmd {
 	if m.sup == nil {
-		return
+		return func() tea.Msg { return supShutdownDoneMsg{} }
 	}
-	ctx := context.Background()
+	var ids []core.ProcessID
 	for _, id := range m.ids {
 		st, ok := m.store.Get(id)
 		if !ok {
 			continue
 		}
 		if st == core.StateRunning || st == core.StatePaused || st == core.StateStarting {
-			_ = m.sup.Stop(ctx, id)
+			ids = append(ids, id)
 		}
 	}
+	return supShutdownAllCmd(m.sup, ids)
 }
 
 func (m *model) Init() tea.Cmd {
@@ -1326,6 +1406,22 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.consumeBusEvent(core.Event(msg))
 		m.drainEvents()
 		return m, m.listenCmd()
+	case supOpDoneMsg:
+		m.appendCtlErrFor(msg.op, msg.id, msg.name, msg.err)
+		m.drainEvents()
+		m.refreshProcs()
+		return m, nil
+	case supShutdownDoneMsg:
+		return m, tea.Quit
+	case supReplaceSaveDoneMsg:
+		return m.handleReplaceSaveDone(msg)
+	case copyLogDoneMsg:
+		if msg.err != nil {
+			m.appendToast(ToastErr, "Clipboard: "+msg.err.Error())
+		} else {
+			m.appendToast(ToastOK, "Copied visible log (plain text)")
+		}
+		return m, nil
 	case tickMsg:
 		m.tick++
 		m.drainEvents()
@@ -1361,54 +1457,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.overlay == overlayLogFilter {
 			m.syncFilterInpWidth(m.lineFormInnerW())
 		}
-	case tea.MouseMsg:
-		logH, _ := m.layoutHeights()
-		if msg.Y >= logH {
-			break
-		}
-		me := tea.MouseEvent(msg)
-		// Many terminals (e.g. macOS) translate Shift+vertical wheel into horizontal
-		// wheel buttons with Shift=false; accept wheel regardless of press vs release
-		// where some emulators differ.
-		if !me.IsWheel() && me.Action != tea.MouseActionPress {
-			break
-		}
-		if me.IsWheel() && me.Action == tea.MouseActionMotion {
-			break
-		}
-		switch msg.Button {
-		case tea.MouseButtonWheelLeft:
-			// Usually paired with Shift+wheel up (see WheelRight comment).
-			if m.logHScroll >= 3 {
-				m.logHScroll -= 3
-			} else {
-				m.logHScroll = 0
-			}
-		case tea.MouseButtonWheelRight:
-			// Many terminals send this instead of Shift+vertical wheel for horizontal scroll.
-			m.logHScroll += 3
-		case tea.MouseButtonWheelDown:
-			if msg.Shift {
-				m.logHScroll += 3
-			} else {
-				// Toward tail (newer); logScroll counts back from newest matching line.
-				if m.logScroll >= 3 {
-					m.logScroll -= 3
-				} else {
-					m.logScroll = 0
-				}
-			}
-		case tea.MouseButtonWheelUp:
-			if msg.Shift {
-				if m.logHScroll >= 3 {
-					m.logHScroll -= 3
-				} else {
-					m.logHScroll = 0
-				}
-			} else {
-				m.logScroll += 3
-			}
-		}
 	case tea.KeyMsg:
 		if m.overlay == overlayKillSignal {
 			if msg.String() == "?" {
@@ -1422,7 +1470,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.clearPendingQuit()
 				return m, nil
 			case "enter":
-				m.applyKillSignalChoice()
+				if cmd := m.applyKillSignalChoice(); cmd != nil {
+					return m, cmd
+				}
 				return m, nil
 			}
 			switch msg.Type {
@@ -1573,17 +1623,21 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.overlay == overlayHelp {
 					break
 				}
-				if m.logHScroll >= 3 {
-					m.logHScroll -= 3
-				} else {
-					m.logHScroll = 0
+				if !m.logWordWrap {
+					if m.logHScroll >= 3 {
+						m.logHScroll -= 3
+					} else {
+						m.logHScroll = 0
+					}
 				}
 				return m, nil
 			case tea.KeyRight:
 				if m.overlay == overlayHelp {
 					break
 				}
-				m.logHScroll += 3
+				if !m.logWordWrap {
+					m.logHScroll += 3
+				}
 				return m, nil
 			}
 		}
@@ -1605,7 +1659,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			case "enter":
 				if edit {
-					m.tryEditProcess()
+					if cmd := m.tryEditProcess(); cmd != nil {
+						return m, cmd
+					}
 				} else {
 					m.tryAddProcess()
 				}
@@ -1662,8 +1718,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			case overlayNone:
 				if m.pendingQuit && !m.pendingQuitDeadline.IsZero() && time.Now().Before(m.pendingQuitDeadline) {
-					m.shutdownProcs()
-					return m, tea.Quit
+					return m, m.shutdownGracefulCmd()
 				}
 				m.clearPendingDelete()
 				m.clearPendingStop()
@@ -1765,6 +1820,26 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.showStderr = !m.showStderr
 			m.forceLogRebuild()
+		case "w":
+			if m.overlay == overlayHelp {
+				break
+			}
+			m.logWordWrap = !m.logWordWrap
+			m.logHScroll = 0
+			if m.logWordWrap {
+				m.appendToast(ToastOK, "Log word wrap on")
+			} else {
+				m.appendToast(ToastOK, "Log word wrap off")
+			}
+		case "c":
+			if m.overlay == overlayHelp {
+				break
+			}
+			if m.overlay != overlayNone {
+				break
+			}
+			logH, _ := m.layoutHeights()
+			return m, runCopyLogPlainCmd(m.plainLogViewportText(logH))
 		case "P":
 			if m.overlay == overlayHelp {
 				break
@@ -1886,7 +1961,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.clearPendingStop()
 				m.clearPendingQuit()
 				m.clearPendingDelete()
-				m.stopAllGraceful(context.Background())
+				if cmd := m.stopAllGracefulCmd(); cmd != nil {
+					return m, cmd
+				}
 				break
 			}
 			if !m.anyStoppableProcess() {
@@ -1926,8 +2003,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.clearPendingStopAll()
 				m.clearPendingQuit()
 				m.clearPendingDelete()
-				ctx := context.Background()
-				m.appendCtlErr("stop", m.sup.Stop(ctx, id))
+				if cmd := supStopCmd(m.sup, id, m.nameForID(id)); cmd != nil {
+					return m, cmd
+				}
 				break
 			}
 			if !m.stopArmEligible(id) {
@@ -2045,31 +2123,46 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.sup == nil {
 				break
 			}
-			ctx := context.Background()
 			switch msg.String() {
 			case "S":
-				m.startAllGraceful(ctx)
+				if cmd := m.startAllGracefulCmd(); cmd != nil {
+					return m, cmd
+				}
 			case "Z":
-				m.pauseAllGraceful(ctx)
+				if cmd := m.pauseAllGracefulCmd(); cmd != nil {
+					return m, cmd
+				}
 			case "V":
-				m.continueAllGraceful(ctx)
+				if cmd := m.continueAllGracefulCmd(); cmd != nil {
+					return m, cmd
+				}
 			case "Y":
-				m.restartAllGraceful(ctx)
+				if cmd := m.restartAllGracefulCmd(); cmd != nil {
+					return m, cmd
+				}
 			case "s":
 				if id := m.currentID(); id != "" {
-					m.appendCtlErr("start", m.sup.Start(ctx, id))
+					if cmd := supStartCmd(m.sup, id, m.nameForID(id)); cmd != nil {
+						return m, cmd
+					}
 				}
 			case "z":
 				if id := m.currentID(); id != "" {
-					m.appendCtlErr("pause", m.sup.Pause(ctx, id))
+					if cmd := supPauseCmd(m.sup, id, m.nameForID(id)); cmd != nil {
+						return m, cmd
+					}
 				}
 			case "v":
 				if id := m.currentID(); id != "" {
-					m.appendCtlErr("continue", m.sup.Continue(ctx, id))
+					if cmd := supContinueCmd(m.sup, id, m.nameForID(id)); cmd != nil {
+						return m, cmd
+					}
 				}
 			case "y":
 				if id := m.currentID(); id != "" {
-					m.appendCtlErr("restart", m.sup.Restart(ctx, id))
+					if cmd := supRestartCmd(m.sup, id, m.nameForID(id)); cmd != nil {
+						return m, cmd
+					}
 				}
 			}
 		}
@@ -2164,7 +2257,9 @@ func (m *model) renderFooter() string {
 	return StyleFooterMuted(padRight(truncate(s, w), w))
 }
 
-func (m *model) renderBody(bodyH int) string {
+// logViewportStyledLines returns the same log rows shown in the main pane (styled),
+// including word wrap and horizontal pan, before joining for View().
+func (m *model) logViewportStyledLines(bodyH int) []string {
 	w := m.width
 	if w < 1 {
 		w = 1
@@ -2174,12 +2269,44 @@ func (m *model) renderBody(bodyH int) string {
 		h = 1
 	}
 
-	lines := m.composeLines(h)
-	m.clampLogHScroll(lines, w)
-	for i := range lines {
-		lines[i] = padToCellWidth(ansi.Cut(lines[i], m.logHScroll, m.logHScroll+w), w)
+	var lines []string
+	if m.logWordWrap {
+		m.logHScroll = 0
+		if err := m.syncLogIndices(); err != nil {
+			lines = neutralPlaceholders(h)
+		} else {
+			m.clampLogScroll()
+			nameCol := dockNameColumnWidth(m.processes, 4, 32)
+			var err error
+			lines, err = BuildWrappedWindowLinesFromIndices(m.slog, m.matchedIdx, m.logScroll, h, w, m.logTimePrec, m.dockIDStrings(), nameCol)
+			if err != nil {
+				lines = neutralPlaceholders(h)
+			}
+		}
+		for i := range lines {
+			lines[i] = padToCellWidth(lines[i], w)
+		}
+	} else {
+		lines = m.composeLines(h)
+		m.clampLogHScroll(lines, w)
+		for i := range lines {
+			lines[i] = padToCellWidth(ansi.Cut(lines[i], m.logHScroll, m.logHScroll+w), w)
+		}
 	}
+	return lines
+}
 
+func (m *model) renderBody(bodyH int) string {
+	lines := m.logViewportStyledLines(bodyH)
+	return strings.Join(lines, "\n")
+}
+
+// plainLogViewportText is the visible log as plain text (ANSI stripped, trailing pad spaces trimmed).
+func (m *model) plainLogViewportText(bodyH int) string {
+	lines := m.logViewportStyledLines(bodyH)
+	for i := range lines {
+		lines[i] = strings.TrimRight(ansi.Strip(lines[i]), " ")
+	}
 	return strings.Join(lines, "\n")
 }
 
@@ -2214,6 +2341,10 @@ func (m *model) clampLogScroll() {
 
 // clampLogHScroll keeps horizontal pan within the widest visible log line.
 func (m *model) clampLogHScroll(lines []string, viewW int) {
+	if m.logWordWrap {
+		m.logHScroll = 0
+		return
+	}
 	if viewW < 1 {
 		m.logHScroll = 0
 		return
@@ -2282,7 +2413,7 @@ func (m *model) helpOverlayContent() (title string, bodyLines []string) {
 	case overlayLogFilter:
 		title = "Log filter help"
 		bodyLines = []string{
-			"Restricts which merged log lines match (Go regexp). Empty clears the filter.",
+			"Restricts which merged log lines match. Empty clears the filter.",
 			"",
 			"  Enter       apply and close  ·  Esc Ctrl+c cancel",
 			"  ? Esc       close this help",
@@ -2333,25 +2464,28 @@ func (m *model) helpOverlayContent() (title string, bodyLines []string) {
 		bodyLines = []string{
 			"One merged log for all processes (dock selection does not swap the log).",
 			"Log lines are stored on disk (unlinked temp); use imux --tee for a persisted copy.",
+			"Scroll the log with ↑ ↓ PgUp PgDn and Home/End; drag with the mouse to select like any terminal text.",
+			"From this sheet (main view): any other key runs that shortcut and closes help.",
 			"",
 			"Keys:",
-			"From this sheet (main view): any other key runs that shortcut and closes help.",
-			"  Tab Shift+Tab move selection in the bottom dock (also Shift+↑↓ or , .)",
+			"  Tab Shift+Tab move dock selection (Shift+↑↓ same as on dock)",
 			"  1-9           jump to process slot (first nine)",
 			"  s t z v y     start / stop / pause / continue / restart (selected)",
-			"  k             signal menu for selected slot, then Enter",
-			"  K             same menu for every running process, then Enter",
+			"  k             signal menu for selected slot, then enter",
+			"  K             same menu for every running process, then enter",
 			"  S T Z V Y     bulk start / stop all / pause / continue / restart",
 			"  , or .        previous / next process (same as Tab / Shift+Tab)",
 			"  n             new",
-			"  i             inspector (Esc or Enter closes, r refreshes)",
-			"  Enter         edit name + command for the selected slot",
-			"  d             delete slot (twice to confirm; slot must be stopped)",
-			"  o e           toggle stdout / stderr in the log view",
+			"  i             inspector",
+			"  enter         edit name + command for the selected slot",
+			"  d             delete slot",
+			"  o e           toggle stdout / stderr",
+			"  w             toggle log word wrap",
+			"  c             copy visible log",
 			"  p P           log time precision: p next, P prev (off → s → ms → us)",
-			"  /             edit log filter (regular expression)",
+			"  /             edit log filter",
 			"  ? Esc         help · close overlay",
-			"  q Ctrl+c      quit (press twice to confirm; stops children)",
+			"  q Ctrl+c      quit",
 			"",
 			focusLine,
 		}
@@ -2359,23 +2493,69 @@ func (m *model) helpOverlayContent() (title string, bodyLines []string) {
 	return title, bodyLines
 }
 
-// wrapModalLines word-wraps each logical line to w terminal cells and flattens
-// the result (empty strings preserved as paragraph breaks).
-func wrapModalLines(lines []string, w int) []string {
+// helpStructuredRow is true for key-binding rows and the "Keys:" header so help
+// prose can be merged and wrapped as flowing paragraphs without breaking at each
+// source string boundary.
+func helpStructuredRow(s string) bool {
+	if strings.HasPrefix(s, "  ") {
+		return true
+	}
+	return s == "Keys:"
+}
+
+// wrapModalLines word-wraps to w terminal cells. When mergeHelpProse is true
+// (help overlay only), consecutive non-empty lines that are not helpStructuredRow
+// are joined with spaces and wrapped as one paragraph so breaks follow the pane
+// width instead of artificial line breaks in the source.
+func wrapModalLines(lines []string, w int, mergeHelpProse bool) []string {
 	if w < 4 {
 		w = 4
 	}
-	var out []string
-	for _, ln := range lines {
-		if ln == "" {
-			out = append(out, "")
-			continue
+	if !mergeHelpProse {
+		var out []string
+		for _, ln := range lines {
+			if ln == "" {
+				out = append(out, "")
+				continue
+			}
+			wrapped := ansi.Wrap(ln, w, "")
+			for _, seg := range strings.Split(wrapped, "\n") {
+				out = append(out, seg)
+			}
 		}
-		wrapped := ansi.Wrap(ln, w, "")
+		return out
+	}
+
+	var out []string
+	var prose []string
+	flushProse := func() {
+		if len(prose) == 0 {
+			return
+		}
+		joined := strings.Join(prose, " ")
+		prose = prose[:0]
+		wrapped := ansi.Wrap(joined, w, "")
 		for _, seg := range strings.Split(wrapped, "\n") {
 			out = append(out, seg)
 		}
 	}
+	for _, ln := range lines {
+		if ln == "" {
+			flushProse()
+			out = append(out, "")
+			continue
+		}
+		if helpStructuredRow(ln) {
+			flushProse()
+			wrapped := ansi.Wrap(ln, w, "")
+			for _, seg := range strings.Split(wrapped, "\n") {
+				out = append(out, seg)
+			}
+			continue
+		}
+		prose = append(prose, ln)
+	}
+	flushProse()
 	return out
 }
 
@@ -2429,8 +2609,7 @@ func (m *model) renderModal() string {
 		title = "Log filter"
 		m.syncFilterInpWidth(innerW)
 		bodyLines = []string{
-			"Regular expression (Go syntax). Empty clears the filter.",
-			"CLI: --log-filter 're:…' or a bare pattern.",
+			"CLI: --log-filter 're:…' or a bare pattern. Empty clears.",
 			"",
 			m.filterInp.View(),
 			"",
@@ -2456,19 +2635,19 @@ func (m *model) renderModal() string {
 		bodyLines = []string{}
 	}
 
-	bodyLines = wrapModalLines(bodyLines, innerW)
+	bodyLines = wrapModalLines(bodyLines, innerW, m.overlay == overlayHelp)
 
 	maxOuter := m.height - 4
 	if maxOuter < 7 {
 		maxOuter = 7
 	}
 	maxInner := maxOuter - 2
-	// Inner rows = title row + body (header is rendered separately below).
-	innerLines := min(maxInner, max(3, 1+len(bodyLines)))
+	// Inner rows = title + blank separator + body (header rendered separately below).
+	innerLines := min(maxInner, max(3, 2+len(bodyLines)))
 
 	formOverlay := m.overlay == overlayAddProcess || m.overlay == overlayEditProcess || m.overlay == overlayLogFilter || m.overlay == overlayKillSignal
 
-	bodyCapacity := innerLines - 1
+	bodyCapacity := innerLines - 2
 	if bodyCapacity < 1 {
 		bodyCapacity = 1
 	}
@@ -2496,8 +2675,9 @@ func (m *model) renderModal() string {
 		bodyLines[i] = padToCellWidth(bodyLines[i], innerW)
 	}
 
-	header := padToCellWidth(" "+title+" ", innerW)
-	all := append([]string{header}, bodyLines...)
+	header := padToCellWidth(title, innerW)
+	sep := padToCellWidth("", innerW)
+	all := append([]string{header, sep}, bodyLines...)
 
 	// Modal: no fill color — use the terminal default background/foreground so it matches the rest of the UI.
 	style := lipgloss.NewStyle().
@@ -2582,7 +2762,7 @@ func Run(opts Options) error {
 	ttyOpts, cleanupTTY := ttyProgramOpts()
 	defer cleanupTTY()
 
-	base := []tea.ProgramOption{tea.WithAltScreen(), tea.WithMouseCellMotion()}
+	base := []tea.ProgramOption{tea.WithAltScreen()}
 	p := tea.NewProgram(m, append(base, ttyOpts...)...)
 	_, err = p.Run()
 	if err != nil && strings.Contains(err.Error(), "could not open a new TTY") {

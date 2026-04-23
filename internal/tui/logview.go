@@ -229,7 +229,9 @@ func BuildWindowLinesFromIndices(
 	return out, nil
 }
 
-func formatStyledLogLine(rec sessionlog.Record, timePrec logTimePrecision, dockIDOrder []string, nameColW int) string {
+// styledLogPrefix returns the styled stream badge, padded name in brackets, and
+// optional timestamp block, including the trailing space before the message body.
+func styledLogPrefix(rec sessionlog.Record, timePrec logTimePrecision, dockIDOrder []string, nameColW int) string {
 	who := rec.Name
 	if who == "" {
 		who = string(rec.ID)
@@ -259,9 +261,110 @@ func formatStyledLogLine(rec sessionlog.Record, timePrec logTimePrecision, dockI
 	if layout := timePrec.goTimeLayout(); layout != "" {
 		ts := rec.T.Format(layout)
 		tsStyled := lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("[" + ts + "]")
-		return prefStyled + " " + tsStyled + " " + rec.Msg
+		return prefStyled + " " + tsStyled + " "
 	}
-	return prefStyled + " " + rec.Msg
+	return prefStyled + " "
+}
+
+// wrapLogLineWithBadgeIndent wraps msg to the pane width while keeping the styled
+// prefix on the first row only; continuation rows are left-padded (plain spaces)
+// to the prefix display width so message text lines up under the first line’s body.
+func wrapLogLineWithBadgeIndent(prefix, msg string, viewW int) []string {
+	if viewW < 1 {
+		viewW = 1
+	}
+	pw := ansi.StringWidth(prefix)
+	if pw >= viewW {
+		return []string{ansi.Truncate(prefix+msg, viewW, "")}
+	}
+	msgW := viewW - pw
+	if msgW < 1 {
+		msgW = 1
+	}
+	if msg == "" {
+		line := prefix
+		if ansi.StringWidth(line) > viewW {
+			line = ansi.Truncate(line, viewW, "")
+		}
+		return []string{line}
+	}
+	wrapped := ansi.Wrap(msg, msgW, "")
+	segs := strings.Split(wrapped, "\n")
+	indent := strings.Repeat(" ", pw)
+	out := make([]string, 0, len(segs))
+	for i, seg := range segs {
+		var line string
+		if i == 0 {
+			line = prefix + seg
+		} else {
+			line = indent + seg
+		}
+		if ansi.StringWidth(line) > viewW {
+			line = ansi.Truncate(line, viewW, "")
+		}
+		out = append(out, line)
+	}
+	return out
+}
+
+// BuildWrappedWindowLinesFromIndices renders matched records like BuildWindowLinesFromIndices
+// but each logical line is wrapped with wrapLogLineWithBadgeIndent, then flattened
+// and tail-trimmed to bodyH rows (oldest at [0], newest at [len-1]).
+func BuildWrappedWindowLinesFromIndices(
+	slog *sessionlog.SessionLog,
+	indices []int64,
+	scrollBack, bodyH, viewW int,
+	timePrec logTimePrecision,
+	dockIDOrder []string,
+	nameColW int,
+) ([]string, error) {
+	if bodyH < 1 {
+		return nil, nil
+	}
+	if viewW < 1 {
+		viewW = 1
+	}
+	if slog == nil {
+		return neutralPlaceholders(bodyH), nil
+	}
+	n, err := slog.LineCount()
+	if err != nil {
+		return nil, err
+	}
+	if n == 0 {
+		return neutralPlaceholders(bodyH), nil
+	}
+	if len(indices) == 0 {
+		return neutralPlaceholders(bodyH), nil
+	}
+	if scrollBack >= len(indices) {
+		return scrolledPastPlaceholders(bodyH), nil
+	}
+	end := scrollBack + bodyH
+	if end > len(indices) {
+		end = len(indices)
+	}
+	slice := indices[scrollBack:end]
+	var flat []string
+	for i := len(slice) - 1; i >= 0; i-- {
+		rec, err := slog.ReadLine(slice[i])
+		if err != nil {
+			return nil, err
+		}
+		prefix := styledLogPrefix(rec, timePrec, dockIDOrder, nameColW)
+		flat = append(flat, wrapLogLineWithBadgeIndent(prefix, rec.Msg, viewW)...)
+	}
+	if len(flat) > bodyH {
+		flat = flat[len(flat)-bodyH:]
+	}
+	for len(flat) < bodyH {
+		flat = append([]string{""}, flat...)
+	}
+	return flat, nil
+}
+
+func formatStyledLogLine(rec sessionlog.Record, timePrec logTimePrecision, dockIDOrder []string, nameColW int) string {
+	return styledLogPrefix(rec, timePrec, dockIDOrder, nameColW) + rec.Msg
 }
 
 func neutralPlaceholders(n int) []string {
