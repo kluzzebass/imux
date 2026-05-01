@@ -17,12 +17,12 @@ type killMenuChoice struct {
 func killSignalMenu() []killMenuChoice {
 	if runtime.GOOS == "windows" {
 		return []killMenuChoice{
-			{label: "Graceful stop (wait, then hard terminate if needed)", sig: core.UserSignalStopGraceful},
+			{label: "Graceful terminate (wait, then hard kill if needed)", sig: core.UserSignalStopGraceful},
 			{label: "Force terminate (hard kill)", sig: core.UserSignalForceKill},
 		}
 	}
 	return []killMenuChoice{
-		{label: "Graceful stop (SIGTERM, wait, SIGKILL if still alive)", sig: core.UserSignalStopGraceful},
+		{label: "Graceful terminate (SIGTERM, wait, SIGKILL if still alive)", sig: core.UserSignalStopGraceful},
 		{label: "SIGTERM — single signal (no automatic follow-up kill)", sig: core.UserSignalSIGTERMOnce},
 		{label: "SIGINT — interrupt", sig: core.UserSignalInterrupt},
 		{label: "SIGHUP — hang up", sig: core.UserSignalHangup},

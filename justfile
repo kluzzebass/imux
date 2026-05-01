@@ -24,6 +24,18 @@ _default:
 imux *args:
   cd "{{ justfile_directory() }}" && exec go run . "$@"
 
+# TUI demo: a handful of long-running, varied processes for poking the UI.
+# Mix of: continuous output (ping, counter), bursty (yes pipe), JSON-ish, and a
+# fast-exiting failure so r/R/restart/kill flows have something to grab.
+demo:
+  cd "{{ justfile_directory() }}" && exec go run . \
+    --name ping,counter,chatter,json,flaky \
+    'ping -i 1 127.0.0.1' \
+    'i=0; while :; do printf "tick %d\n" "$i"; i=$((i+1)); sleep 1; done' \
+    'while :; do echo "the quick brown fox jumps over the lazy dog"; sleep 0.3; done' \
+    'i=0; while :; do printf "{\"ts\":\"%s\",\"level\":\"info\",\"i\":%d,\"msg\":\"hello\"}\n" "$(date -u +%FT%TZ)" "$i"; i=$((i+1)); sleep 2; done' \
+    'echo "boom" >&2; sleep 1; exit 1'
+
 # Build local binary
 build:
   mkdir -p bin

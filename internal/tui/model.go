@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"runtime"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -653,6 +652,7 @@ func (m *model) startAllGracefulCmd() tea.Cmd {
 		return nil
 	}
 	var cmds []tea.Cmd
+	var names []string
 	for _, id := range m.ids {
 		st, ok := m.store.Get(id)
 		if !ok {
@@ -663,9 +663,10 @@ func (m *model) startAllGracefulCmd() tea.Cmd {
 			id := id
 			name := m.nameForID(id)
 			sup := m.sup
+			names = append(names, name)
 			cmds = append(cmds, func() tea.Msg {
 				err := sup.Start(context.Background(), id)
-				return supOpDoneMsg{op: "start", id: id, name: name, err: err}
+				return supOpDoneMsg{op: "run", id: id, name: name, err: err, bulk: true}
 			})
 		default:
 			// running, starting, paused, stopping: skip
@@ -674,6 +675,7 @@ func (m *model) startAllGracefulCmd() tea.Cmd {
 	if len(cmds) == 0 {
 		return nil
 	}
+	m.appendToast(ToastOK, fmt.Sprintf("Run all (%d): %s", len(names), strings.Join(names, ", ")))
 	return tea.Batch(cmds...)
 }
 
@@ -682,6 +684,7 @@ func (m *model) stopAllGracefulCmd() tea.Cmd {
 		return nil
 	}
 	var cmds []tea.Cmd
+	var names []string
 	for _, id := range m.ids {
 		st, ok := m.store.Get(id)
 		if !ok {
@@ -692,9 +695,10 @@ func (m *model) stopAllGracefulCmd() tea.Cmd {
 			id := id
 			name := m.nameForID(id)
 			sup := m.sup
+			names = append(names, name)
 			cmds = append(cmds, func() tea.Msg {
 				err := sup.Stop(context.Background(), id)
-				return supOpDoneMsg{op: "stop", id: id, name: name, err: err}
+				return supOpDoneMsg{op: "terminate", id: id, name: name, err: err, bulk: true}
 			})
 		default:
 			// pending, exited, failed, stopping: skip
@@ -703,6 +707,7 @@ func (m *model) stopAllGracefulCmd() tea.Cmd {
 	if len(cmds) == 0 {
 		return nil
 	}
+	m.appendToast(ToastOK, fmt.Sprintf("Terminate all (%d): %s", len(names), strings.Join(names, ", ")))
 	return tea.Batch(cmds...)
 }
 
@@ -711,6 +716,7 @@ func (m *model) pauseAllGracefulCmd() tea.Cmd {
 		return nil
 	}
 	var cmds []tea.Cmd
+	var names []string
 	for _, id := range m.ids {
 		st, ok := m.store.Get(id)
 		if !ok || st != core.StateRunning {
@@ -719,14 +725,16 @@ func (m *model) pauseAllGracefulCmd() tea.Cmd {
 		id := id
 		name := m.nameForID(id)
 		sup := m.sup
+		names = append(names, name)
 		cmds = append(cmds, func() tea.Msg {
 			err := sup.Pause(context.Background(), id)
-			return supOpDoneMsg{op: "pause", id: id, name: name, err: err}
+			return supOpDoneMsg{op: "pause", id: id, name: name, err: err, bulk: true}
 		})
 	}
 	if len(cmds) == 0 {
 		return nil
 	}
+	m.appendToast(ToastOK, fmt.Sprintf("Pause all (%d): %s", len(names), strings.Join(names, ", ")))
 	return tea.Batch(cmds...)
 }
 
@@ -735,6 +743,7 @@ func (m *model) continueAllGracefulCmd() tea.Cmd {
 		return nil
 	}
 	var cmds []tea.Cmd
+	var names []string
 	for _, id := range m.ids {
 		st, ok := m.store.Get(id)
 		if !ok || st != core.StatePaused {
@@ -743,14 +752,16 @@ func (m *model) continueAllGracefulCmd() tea.Cmd {
 		id := id
 		name := m.nameForID(id)
 		sup := m.sup
+		names = append(names, name)
 		cmds = append(cmds, func() tea.Msg {
 			err := sup.Continue(context.Background(), id)
-			return supOpDoneMsg{op: "continue", id: id, name: name, err: err}
+			return supOpDoneMsg{op: "continue", id: id, name: name, err: err, bulk: true}
 		})
 	}
 	if len(cmds) == 0 {
 		return nil
 	}
+	m.appendToast(ToastOK, fmt.Sprintf("Continue all (%d): %s", len(names), strings.Join(names, ", ")))
 	return tea.Batch(cmds...)
 }
 
@@ -759,6 +770,7 @@ func (m *model) restartAllGracefulCmd() tea.Cmd {
 		return nil
 	}
 	var cmds []tea.Cmd
+	var names []string
 	for _, id := range m.ids {
 		st, ok := m.store.Get(id)
 		if !ok || st == core.StateStopping {
@@ -767,14 +779,16 @@ func (m *model) restartAllGracefulCmd() tea.Cmd {
 		id := id
 		name := m.nameForID(id)
 		sup := m.sup
+		names = append(names, name)
 		cmds = append(cmds, func() tea.Msg {
 			err := sup.Restart(context.Background(), id)
-			return supOpDoneMsg{op: "restart", id: id, name: name, err: err}
+			return supOpDoneMsg{op: "restart", id: id, name: name, err: err, bulk: true}
 		})
 	}
 	if len(cmds) == 0 {
 		return nil
 	}
+	m.appendToast(ToastOK, fmt.Sprintf("Restart all (%d): %s", len(names), strings.Join(names, ", ")))
 	return tea.Batch(cmds...)
 }
 
@@ -952,7 +966,7 @@ func (m *model) tryAddProcess() {
 			m.modalErr = fmt.Sprintf("Register: %v", err)
 			return
 		}
-		m.appendToast(ToastOK, fmt.Sprintf("Registered %s (%s); press s to start", id, name))
+		m.appendToast(ToastOK, fmt.Sprintf("Registered %s (%s); press r to run", id, name))
 		m.refreshProcs()
 		for i, pid := range m.ids {
 			if pid == id {
@@ -989,7 +1003,7 @@ func (m *model) deletePrevalidate(id core.ProcessID) error {
 		return fmt.Errorf("unknown process")
 	}
 	if st == core.StateRunning || st == core.StateStarting || st == core.StatePaused || st == core.StateStopping {
-		return fmt.Errorf("stop the process before removing its slot")
+		return fmt.Errorf("terminate the process before removing its slot")
 	}
 	return nil
 }
@@ -1130,7 +1144,7 @@ func (m *model) tryEditProcess() tea.Cmd {
 		m.refreshProcs()
 		return nil
 	}
-	m.appendToast(ToastOK, fmt.Sprintf("Updated %s (%s); press s to run when ready", id, name))
+	m.appendToast(ToastOK, fmt.Sprintf("Updated %s (%s); press r to run when ready", id, name))
 	m.refreshProcs()
 	for i, pid := range m.ids {
 		if pid == id {
@@ -1146,7 +1160,7 @@ func (m *model) handleReplaceSaveDone(msg supReplaceSaveDoneMsg) (tea.Model, tea
 	id := msg.id
 	name := msg.name
 	if msg.err != nil {
-		m.modalErr = fmt.Sprintf("Edit: replace blocked while running; stop failed: %v", msg.err)
+		m.modalErr = fmt.Sprintf("Edit: replace blocked while running; terminate failed: %v", msg.err)
 		m.refreshProcs()
 		return m, m.refocusLineFormCurrent()
 	}
@@ -1155,7 +1169,7 @@ func (m *model) handleReplaceSaveDone(msg supReplaceSaveDoneMsg) (tea.Model, tea
 		m.refreshProcs()
 		return m, m.refocusLineFormCurrent()
 	}
-	m.appendToast(ToastOK, fmt.Sprintf("Stopped and saved %s (%s); press s to run when ready", id, name))
+	m.appendToast(ToastOK, fmt.Sprintf("Terminated and saved %s (%s); press r to run when ready", id, name))
 	m.refreshProcs()
 	for i, pid := range m.ids {
 		if pid == id {
@@ -1175,7 +1189,6 @@ func (m *model) refreshProcs() {
 	if err != nil {
 		return
 	}
-	sort.Slice(specs, func(i, j int) bool { return specs[i].ID < specs[j].ID })
 
 	specIDs := make(map[core.ProcessID]struct{}, len(specs))
 	for _, sp := range specs {
@@ -1407,7 +1420,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.drainEvents()
 		return m, m.listenCmd()
 	case supOpDoneMsg:
-		m.appendCtlErrFor(msg.op, msg.id, msg.name, msg.err)
+		if !(msg.bulk && msg.err == nil) {
+			m.appendCtlErrFor(msg.op, msg.id, msg.name, msg.err)
+		}
 		m.drainEvents()
 		m.refreshProcs()
 		return m, nil
@@ -1967,7 +1982,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				break
 			}
 			if !m.anyStoppableProcess() {
-				m.appendToast(ToastErr, "Stop all: nothing running to stop")
+				m.appendToast(ToastErr, "Terminate all: nothing running to terminate")
 				break
 			}
 			m.clearPendingQuit()
@@ -1990,7 +2005,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			id := m.currentID()
 			if id == "" {
-				m.appendToast(ToastErr, "Stop: no process selected")
+				m.appendToast(ToastErr, "Terminate: no process selected")
 				break
 			}
 			if m.pendingStop {
@@ -2009,7 +2024,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				break
 			}
 			if !m.stopArmEligible(id) {
-				m.appendToast(ToastErr, "Stop: nothing to stop in this state")
+				m.appendToast(ToastErr, "Terminate: nothing to terminate in this state")
 				break
 			}
 			m.clearPendingQuit()
@@ -2048,6 +2063,21 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "r":
 			if m.overlay == overlayInspector {
 				m.refreshInspector()
+				break
+			}
+			if m.overlay == overlayHelp {
+				break
+			}
+			if m.overlay == overlayAddProcess || m.overlay == overlayEditProcess || m.overlay == overlayLogFilter || m.overlay == overlayKillSignal {
+				break
+			}
+			if m.sup == nil {
+				break
+			}
+			if id := m.currentID(); id != "" {
+				if cmd := supStartCmd(m.sup, id, m.nameForID(id)); cmd != nil {
+					return m, cmd
+				}
 			}
 		case "k":
 			if m.overlay == overlayHelp {
@@ -2124,7 +2154,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				break
 			}
 			switch msg.String() {
-			case "S":
+			case "R":
 				if cmd := m.startAllGracefulCmd(); cmd != nil {
 					return m, cmd
 				}
@@ -2139,12 +2169,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "Y":
 				if cmd := m.restartAllGracefulCmd(); cmd != nil {
 					return m, cmd
-				}
-			case "s":
-				if id := m.currentID(); id != "" {
-					if cmd := supStartCmd(m.sup, id, m.nameForID(id)); cmd != nil {
-						return m, cmd
-					}
 				}
 			case "z":
 				if id := m.currentID(); id != "" {
@@ -2212,9 +2236,9 @@ func (m *model) renderFooter() string {
 	case overlayInspector:
 		parts = []string{"Esc or Enter closes", "r refresh"}
 	case overlayAddProcess:
-		parts = []string{"Esc cancels", "Tab field", "Enter registers · s starts"}
+		parts = []string{"Esc cancels", "Tab field", "Enter registers · r runs"}
 	case overlayEditProcess:
-		parts = []string{"Esc cancels", "Tab field", "Enter saves · s starts"}
+		parts = []string{"Esc cancels", "Tab field", "Enter saves · r runs"}
 	case overlayLogFilter:
 		parts = []string{"Esc or Ctrl+c cancels", "Enter apply"}
 	case overlayKillSignal:
@@ -2228,10 +2252,10 @@ func (m *model) renderFooter() string {
 				parts = append(parts, "Press d again to confirm delete")
 			}
 			if m.pendingStop {
-				parts = append(parts, "Press t to confirm stop")
+				parts = append(parts, "Press t to confirm terminate")
 			}
 			if m.pendingStopAll {
-				parts = append(parts, "Press T to confirm stop all")
+				parts = append(parts, "Press T to confirm terminate all")
 			}
 			s := joinFooterImportantTrail(parts, "", w)
 			return StyleFooterPending(padRight(truncate(s, w), w))
@@ -2244,8 +2268,8 @@ func (m *model) renderFooter() string {
 		parts = append(parts,
 			"q quit",
 			"n new",
-			"s start",
-			"t stop",
+			"r run",
+			"t terminate",
 			"k signal",
 			"d delete",
 			"i inspect",
@@ -2410,7 +2434,7 @@ func (m *model) helpOverlayContent() (title string, bodyLines []string) {
 		title = "Send signal help"
 		bodyLines = []string{
 			"Pick how to end or interrupt processes. k targets the selected slot; K targets every running slot.",
-			"Graceful stop matches a full Stop (SIGTERM, wait, then SIGKILL if needed on unix).",
+			"Graceful terminate matches a full Terminate (SIGTERM, wait, then SIGKILL if needed on unix).",
 			"Other POSIX signals are sent to the process group; USR1/USR2/WINCH usually leave the child running (see meta lines in the log).",
 			"",
 			"  ↑ ↓         move highlight",
@@ -2437,7 +2461,7 @@ func (m *model) helpOverlayContent() (title string, bodyLines []string) {
 			"Adds a dock slot wrapped like imux run (sh -c … or cmd /C … on Windows).",
 			"",
 			"  Tab         move between name and command fields",
-			"  Enter       register (still stopped; press s on the dock to run)",
+			"  Enter       register (still stopped; press r on the dock to run)",
 			"  Esc Ctrl+c  discard and close",
 			"  ? Esc       close this help",
 			"",
@@ -2447,10 +2471,10 @@ func (m *model) helpOverlayContent() (title string, bodyLines []string) {
 		title = "Edit process help"
 		bodyLines = []string{
 			"Change display name and shell command for this slot.",
-			"If the process is running, Enter stops it for you, then saves (same as replace-then-save).",
+			"If the process is running, Enter terminates it for you, then saves (same as replace-then-save).",
 			"",
 			"  Tab         move between name and command fields",
-			"  Enter       save (press s on the dock when you want it running again)",
+			"  Enter       save (press r on the dock when you want it running again)",
 			"  Esc Ctrl+c  discard and close",
 			"  ? Esc       close this help",
 			"",
@@ -2480,10 +2504,10 @@ func (m *model) helpOverlayContent() (title string, bodyLines []string) {
 			"Keys:",
 			"  Tab Shift+Tab move dock selection (Shift+↑↓ same as on dock)",
 			"  1-9           jump to process slot (first nine)",
-			"  s t z v y     start / stop / pause / continue / restart (selected)",
+			"  r t z v y     run / terminate / pause / continue / restart (selected)",
 			"  k             signal menu for selected slot, then enter",
 			"  K             same menu for every running process, then enter",
-			"  S T Z V Y     bulk start / stop all / pause / continue / restart",
+			"  R T Z V Y     bulk run / terminate all / pause / continue / restart",
 			"  , or .        previous / next process (same as Tab / Shift+Tab)",
 			"  n             new",
 			"  i             inspector",
@@ -2607,13 +2631,13 @@ func (m *model) renderModal() string {
 		title = "New process"
 		bodyLines = appendModalSaveErr(
 			append([]string{"Wrapped like imux run (sh -c or cmd /C)."},
-				m.lineFormModalLines(m.lineFormInnerW(), false, "Esc cancels · Enter registers · Tab switches field · s starts")...),
+				m.lineFormModalLines(m.lineFormInnerW(), false, "Esc cancels · Enter registers · Tab switches field · r runs")...),
 			innerW, m.modalErr)
 	case overlayEditProcess:
 		title = "Edit process"
 		bodyLines = appendModalSaveErr(
 			append([]string{fmt.Sprintf("id %s — same slot.", m.editTargetID)},
-				m.lineFormModalLines(m.lineFormInnerW(), true, "Esc cancels · Enter saves · Tab switches field · s starts when stopped")...),
+				m.lineFormModalLines(m.lineFormInnerW(), true, "Esc cancels · Enter saves · Tab switches field · r runs when stopped")...),
 			innerW, m.modalErr)
 	case overlayLogFilter:
 		title = "Log filter"

@@ -18,6 +18,7 @@ type ExecSupervisor struct {
 	bus       EventBus
 	store     StateStore
 	procs     map[ProcessID]*execProc
+	regOrder  []ProcessID // registration order, preserved across List for deterministic UI ordering
 	stopGrace time.Duration // optional; SIGTERM to SIGKILL window (defaults to 10s if zero)
 }
 
@@ -101,6 +102,7 @@ func (s *ExecSupervisor) Register(_ context.Context, spec ProcessSpec) error {
 		id:   spec.ID,
 	}
 	s.procs[spec.ID] = p
+	s.regOrder = append(s.regOrder, spec.ID)
 	s.store.Set(spec.ID, StatePending)
 	s.emit(spec.ID, EventProcessRegistered, fmt.Sprintf("registered as %q", spec.Name))
 	return nil
@@ -111,8 +113,10 @@ func (s *ExecSupervisor) List(_ context.Context) ([]ProcessSpec, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make([]ProcessSpec, 0, len(s.procs))
-	for _, p := range s.procs {
-		out = append(out, p.spec)
+	for _, id := range s.regOrder {
+		if p, ok := s.procs[id]; ok {
+			out = append(out, p.spec)
+		}
 	}
 	return out, nil
 }
@@ -130,6 +134,12 @@ func (s *ExecSupervisor) Unregister(_ context.Context, id ProcessID) error {
 		return fmt.Errorf("unregister: process %q still has an active child; stop it and wait for exit first", id)
 	}
 	delete(s.procs, id)
+	for i, rid := range s.regOrder {
+		if rid == id {
+			s.regOrder = append(s.regOrder[:i], s.regOrder[i+1:]...)
+			break
+		}
+	}
 	s.mu.Unlock()
 	s.store.Delete(id)
 	s.emit(id, EventProcessRemoved, "unregistered")

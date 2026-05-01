@@ -8,11 +8,14 @@ import (
 )
 
 // supOpDoneMsg is sent after a single supervisor call finishes off the UI thread.
+// bulk is true when this message is one of many emitted by a bulk action (R/T/Z/V/Y);
+// the UI can suppress per-item success toasts to avoid flooding the footer.
 type supOpDoneMsg struct {
 	op   string
 	id   core.ProcessID
 	name string
 	err  error
+	bulk bool
 }
 
 // supShutdownDoneMsg is sent after graceful shutdown of all children (quit path).
@@ -32,7 +35,7 @@ func supStopCmd(sup *core.ExecSupervisor, id core.ProcessID, displayName string)
 	}
 	return func() tea.Msg {
 		err := sup.Stop(context.Background(), id)
-		return supOpDoneMsg{op: "stop", id: id, name: displayName, err: err}
+		return supOpDoneMsg{op: "terminate", id: id, name: displayName, err: err}
 	}
 }
 
@@ -62,7 +65,7 @@ func supStartCmd(sup *core.ExecSupervisor, id core.ProcessID, displayName string
 	}
 	return func() tea.Msg {
 		err := sup.Start(context.Background(), id)
-		return supOpDoneMsg{op: "start", id: id, name: displayName, err: err}
+		return supOpDoneMsg{op: "run", id: id, name: displayName, err: err}
 	}
 }
 
