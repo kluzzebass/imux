@@ -1472,7 +1472,17 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.overlay == overlayLogFilter {
 			m.syncFilterInpWidth(m.lineFormInnerW())
 		}
+		// Force a full erase + repaint so terminals (notably tmux) that may have
+		// dropped or rewrapped lines around the SIGWINCH come back to a known state.
+		// Bubbletea's internal WindowSizeMsg handler only resets the diff cache; it
+		// does not clear the screen, so partial corruption can persist after resize.
+		return m, tea.ClearScreen
 	case tea.KeyMsg:
+		// Ctrl+L: force full repaint. Useful when running under tmux and the
+		// alt-screen falls out of sync (e.g. after scrollback / copy-mode exit).
+		if msg.String() == "ctrl+l" {
+			return m, tea.ClearScreen
+		}
 		if m.overlay == overlayKillSignal {
 			if msg.String() == "?" {
 				m.helpReturnTo = overlayKillSignal
